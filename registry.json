@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "cpa-codex-5h-reset",
+      "name": "Codex 五小时重置唤醒",
+      "description": "按账号查询五小时额度、等待重置后唤醒、30 秒有限重试，支持管理页面和失败通知。",
+      "author": "BIMiracle",
+      "version": "0.2.0",
+      "repository": "https://github.com/BIMiracle/cpa-codex-5h-reset",
+      "license": "MIT",
+      "tags": ["codex", "quota", "5h", "wake"],
+      "install": { "type": "github-release" }
+    }
+  ]
+}

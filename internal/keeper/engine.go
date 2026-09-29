@@ -2,6 +2,8 @@ package keeper
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,100 +17,138 @@ import (
 )
 
 type Auth struct {
-	ID       string `json:"id"`
-	Provider string `json:"provider"`
-	Disabled bool   `json:"disabled"`
+	ID        string `json:"id"`
+	AuthIndex string `json:"auth_index"`
+	Label     string `json:"label"`
+	Provider  string `json:"provider"`
+	Disabled  bool   `json:"disabled"`
 }
-
 type Execution struct {
 	StatusCode int         `json:"status_code"`
 	Headers    http.Header `json:"headers"`
 }
-
 type Host interface {
 	ListAuths() ([]Auth, error)
 	Execute(Auth, Config) (Execution, error)
-	Log(level, event string, fields map[string]any)
-	Notify(authID, reason string, cfg Config)
+	FetchQuota(Auth, time.Time) (Quota, error)
+	Log(string, string, map[string]any)
+	Notify(string, string, Config)
 }
-
 type Slot struct {
 	Key         string    `json:"key"`
 	AuthID      string    `json:"auth_id"`
+	Source      string    `json:"source"`
 	Due         time.Time `json:"due"`
-	Deadline    time.Time `json:"deadline"`
 	Status      string    `json:"status"`
 	Attempts    int       `json:"attempts"`
-	NextAttempt time.Time `json:"next_attempt,omitempty"`
-	ResetAt     time.Time `json:"reset_at,omitempty"`
-	StatusCode  int       `json:"status_code,omitempty"`
+	MaxRetries  int       `json:"max_retries"`
+	NextAttempt time.Time `json:"next_attempt"`
+	Quota       Quota     `json:"quota"`
+	StatusCode  int       `json:"status_code"`
 	LastError   string    `json:"last_error,omitempty"`
-	CompletedAt time.Time `json:"completed_at,omitempty"`
+	CompletedAt time.Time `json:"completed_at"`
 }
 
 func (s Slot) Complete() bool { return !s.CompletedAt.IsZero() }
 
+type LogEntry struct {
+	Time   time.Time `json:"time"`
+	Event  string    `json:"event"`
+	AuthID string    `json:"auth_id,omitempty"`
+	TaskID string    `json:"task_id,omitempty"`
+	Status string    `json:"status,omitempty"`
+}
 type Status struct {
-	Enabled  bool      `json:"enabled"`
-	Model    string    `json:"model"`
-	Timezone string    `json:"timezone"`
-	Times    []string  `json:"times"`
-	Now      time.Time `json:"now"`
-	Slots    []Slot    `json:"slots"`
+	Enabled    bool            `json:"enabled"`
+	Config     Config          `json:"config"`
+	Now        time.Time       `json:"now"`
+	Slots      []Slot          `json:"slots"`
+	Auths      []Auth          `json:"auths"`
+	Schedules  []ScheduledTime `json:"schedules"`
+	StateError string          `json:"state_error,omitempty"`
+	AuthError  string          `json:"auth_error,omitempty"`
+}
+type diskState struct {
+	Schema int               `json:"schema"`
+	Slots  []*Slot           `json:"slots"`
+	Seen   map[string]string `json:"seen"`
+	Logs   []LogEntry        `json:"logs"`
 }
 
-type diskState struct {
-	Schema int    `json:"schema"`
-	Slots  []Slot `json:"slots"`
-}
+var ErrConflict = errors.New("account already has an unfinished task")
+var ErrDisabled = errors.New("plugin is disabled")
+var ErrNoAuth = errors.New("no matching enabled Codex credentials")
 
 type Engine struct {
-	mu      sync.Mutex
-	host    Host
-	cfg     Config
-	slots   map[string]*Slot
-	running map[string]bool
-	stop    chan struct{}
-	done    chan struct{}
-	workers sync.WaitGroup
+	life       sync.Mutex
+	tickMu     sync.Mutex
+	mu         sync.Mutex
+	host       Host
+	cfg        Config
+	slots      map[string]*Slot
+	running    map[string]bool
+	seen       map[string]string
+	logs       []LogEntry
+	auths      []Auth
+	stateError string
+	authError  string
+	active     bool
+	stop       chan struct{}
+	done       chan struct{}
+	workers    sync.WaitGroup
+	lastTick   time.Time
+	now        func() time.Time
 }
 
-func New(host Host) *Engine {
-	return &Engine{host: host, slots: make(map[string]*Slot), running: make(map[string]bool)}
+func New(h Host) *Engine {
+	return &Engine{host: h, slots: map[string]*Slot{}, running: map[string]bool{}, seen: map[string]string{}, now: time.Now}
 }
-
-func (e *Engine) Configure(cfg Config) error {
-	if err := cfg.Validate(); err != nil {
+func (e *Engine) Configure(c Config) error {
+	e.life.Lock()
+	defer e.life.Unlock()
+	if err := c.Validate(); err != nil {
 		return err
 	}
-	e.Stop()
+	// Validate disk input before stopping a working instance.
 	e.mu.Lock()
-	if e.cfg.StateFile != cfg.StateFile {
-		slots, err := loadState(cfg.StateFile)
+	changed := e.cfg.StateFile != c.StateFile
+	e.mu.Unlock()
+	var state diskState
+	var err error
+	if changed {
+		state, err = loadState(c.StateFile, c.MaxRetries)
 		if err != nil {
-			e.mu.Unlock()
 			return err
 		}
-		e.slots = slots
 	}
-	e.cfg = cfg
-	e.running = make(map[string]bool)
-	if cfg.Enabled {
+	e.stopLocked()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if changed {
+		e.slots = map[string]*Slot{}
+		for _, s := range state.Slots {
+			e.slots[s.Key] = s
+		}
+		e.seen = state.Seen
+		e.logs = state.Logs
+	}
+	e.cfg = c.Clone()
+	e.lastTick = e.now().Truncate(time.Minute)
+	e.active = c.Enabled
+	if c.Enabled {
 		e.stop = make(chan struct{})
 		e.done = make(chan struct{})
-	}
-	stop, done := e.stop, e.done
-	e.mu.Unlock()
-	if cfg.Enabled {
-		go e.loop(stop, done)
+		go e.loop(e.stop, e.done)
 	}
 	return nil
 }
-
-func (e *Engine) Stop() {
+func (e *Engine) Stop() { e.life.Lock(); defer e.life.Unlock(); e.stopLocked() }
+func (e *Engine) stopLocked() {
 	e.mu.Lock()
+	e.active = false
 	stop, done := e.stop, e.done
-	e.stop, e.done = nil, nil
+	e.stop = nil
+	e.done = nil
 	e.mu.Unlock()
 	if stop != nil {
 		close(stop)
@@ -116,288 +156,361 @@ func (e *Engine) Stop() {
 	}
 	e.workers.Wait()
 }
-
 func (e *Engine) loop(stop <-chan struct{}, done chan<- struct{}) {
 	defer close(done)
-	e.Tick(time.Now())
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-stop:
 			return
-		case now := <-ticker.C:
-			e.Tick(now)
+		case <-ticker.C:
+			e.Tick(e.now())
 		}
 	}
 }
-
-func slotKey(authID string, due time.Time) string {
-	return fmt.Sprintf("%s|%d", authID, due.Unix())
+func eligible(a Auth, c Config) bool {
+	return strings.EqualFold(a.Provider, "codex") && !a.Disabled && a.ID != "" && c.Selects(a.ID)
 }
-
-// Tick is exported so the scheduler can be tested with a fake clock and host.
+func (e *Engine) pendingLocked(id string) *Slot {
+	for _, s := range e.slots {
+		if s.AuthID == id && !s.Complete() {
+			return s
+		}
+	}
+	return nil
+}
+func (e *Engine) newLocked(id, source string, due time.Time) *Slot {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	s := &Slot{Key: hex.EncodeToString(b), AuthID: id, Source: source, Due: due, Status: "pending", MaxRetries: e.cfg.MaxRetries, NextAttempt: due}
+	e.slots[s.Key] = s
+	return s
+}
 func (e *Engine) Tick(now time.Time) {
+	e.tickMu.Lock()
+	defer e.tickMu.Unlock()
 	e.mu.Lock()
-	cfg := e.cfg
-	enabled := cfg.Enabled && e.stop != nil
+	active := e.active
 	e.mu.Unlock()
-	if !enabled {
+	if !active {
 		return
 	}
 	auths, err := e.host.ListAuths()
-	if err != nil {
-		e.host.Log("warn", "auth_list_failed", map[string]any{"error_type": "host_callback"})
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.active {
 		return
 	}
-	for _, auth := range auths {
-		if !strings.EqualFold(auth.Provider, "codex") || auth.Disabled || auth.ID == "" {
+	if err != nil {
+		e.authError = "auth_list_failed"
+		return
+	}
+	e.authError = ""
+	e.auths = auths
+	c := e.cfg
+	byID := map[string]Auth{}
+	dirty := false
+	for _, a := range auths {
+		if eligible(a, c) {
+			byID[a.ID] = a
+		}
+	}
+	for _, s := range e.slots {
+		if !s.Complete() && !e.running[s.AuthID] {
+			if _, ok := byID[s.AuthID]; !ok {
+				s.Status = "cancelled"
+				s.LastError = "credential_removed_disabled_or_unselected"
+				s.CompletedAt = now
+				dirty = true
+				e.logLocked("task_cancelled", s, now)
+			}
+		}
+	}
+	// Only catch up the preceding 24 hours while running; startup resumes persisted jobs.
+	from := e.lastTick
+	if now.Sub(from) > 24*time.Hour {
+		from = now.Add(-24 * time.Hour)
+	}
+	loc, _ := time.LoadLocation(c.Timezone)
+	local := now.In(loc)
+	for _, schedule := range c.Schedules {
+		if !schedule.Enabled {
 			continue
 		}
-		for _, due := range DueTimes(cfg, now) {
-			deadline := due.Add(time.Duration(cfg.MaxDelayMinutes) * time.Minute)
-			if now.Before(due) || now.After(deadline) {
+		clock, _ := time.Parse("15:04", schedule.At)
+		for day := -1; day <= 0; day++ {
+			due := time.Date(local.Year(), local.Month(), local.Day()+day, clock.Hour(), clock.Minute(), 0, 0, loc)
+			if due.Before(from) || due.After(now) {
 				continue
 			}
-			e.queue(auth, due, deadline, now)
+			for id := range byID {
+				key := id + "|" + schedule.ID
+				stamp := due.Format(time.RFC3339)
+				if e.seen[key] == stamp {
+					continue
+				}
+				e.seen[key] = stamp
+				dirty = true
+				if e.pendingLocked(id) == nil {
+					e.newLocked(id, "scheduled", due)
+				}
+			}
 		}
 	}
-}
-
-func (e *Engine) queue(auth Auth, due, deadline, now time.Time) {
-	key := slotKey(auth.ID, due)
-	e.mu.Lock()
-	slot := e.slots[key]
-	if slot == nil {
-		slot = &Slot{Key: key, AuthID: auth.ID, Due: due, Deadline: deadline, Status: "pending", NextAttempt: now}
-		e.slots[key] = slot
-		e.saveOrLogLocked()
-	}
-	if e.stop == nil || slot.Complete() || e.running[key] || now.Before(slot.NextAttempt) {
-		e.mu.Unlock()
+	e.lastTick = now
+	if (dirty || e.stateError != "") && e.saveLocked() != nil {
 		return
 	}
-	e.running[key] = true
-	e.workers.Add(1)
-	cfg := e.cfg
-	e.mu.Unlock()
-	go e.attempt(auth, key, cfg)
-}
-
-func (e *Engine) Manual(authID string, now time.Time) ([]string, error) {
-	auths, err := e.host.ListAuths()
-	if err != nil {
-		return nil, err
-	}
-	e.mu.Lock()
-	cfg := e.cfg
-	enabled := cfg.Enabled && e.stop != nil
-	e.mu.Unlock()
-	if !enabled {
-		return nil, errors.New("plugin is disabled")
-	}
-	var keys []string
-	for _, auth := range auths {
-		if !strings.EqualFold(auth.Provider, "codex") || auth.Disabled || auth.ID == "" ||
-			(authID != "" && auth.ID != authID) {
+	for _, s := range e.slots {
+		if s.Complete() || e.running[s.AuthID] || now.Before(s.NextAttempt) {
 			continue
 		}
-		due := now.Add(time.Duration(len(keys)) * time.Nanosecond)
-		e.queue(auth, due, due.Add(time.Duration(cfg.MaxDelayMinutes)*time.Minute), now)
-		keys = append(keys, slotKey(auth.ID, due))
+		a, ok := byID[s.AuthID]
+		if !ok {
+			continue
+		}
+		e.launchLocked(a, s, now)
 	}
-	if len(keys) == 0 {
-		return nil, errors.New("no matching active Codex credentials")
+}
+func (e *Engine) Manual(id string, now time.Time) ([]string, error) {
+	e.life.Lock()
+	defer e.life.Unlock()
+	auths, err := e.host.ListAuths()
+	if err != nil {
+		return nil, errors.New("auth_list_failed")
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.active {
+		return nil, ErrDisabled
+	}
+	selected := []Auth{}
+	for _, a := range auths {
+		if eligible(a, e.cfg) && (id == "" || a.ID == id) {
+			if e.pendingLocked(a.ID) != nil {
+				return nil, ErrConflict
+			}
+			selected = append(selected, a)
+		}
+	}
+	if len(selected) == 0 {
+		return nil, ErrNoAuth
+	}
+	keys := []string{}
+	e.auths = auths
+	for _, a := range selected {
+		s := e.newLocked(a.ID, "manual", now)
+		keys = append(keys, s.Key)
+	}
+	if err := e.saveLocked(); err != nil {
+		for _, k := range keys {
+			delete(e.slots, k)
+		}
+		return nil, errors.New("state_write_failed")
+	}
+	for i, a := range selected {
+		e.launchLocked(a, e.slots[keys[i]], now)
 	}
 	return keys, nil
 }
-
-func (e *Engine) attempt(auth Auth, key string, cfg Config) {
+func (e *Engine) launchLocked(a Auth, s *Slot, now time.Time) {
+	if s.Attempts >= 1+s.MaxRetries {
+		e.finishLocked(s, "failed", "retry_limit", now)
+		e.logLocked("task_failed", s, now)
+		_ = e.saveLocked()
+		cfg := e.cfg.Clone()
+		e.workers.Add(1)
+		go func() { defer e.workers.Done(); e.host.Notify(a.ID, "retry_limit", cfg) }()
+		return
+	}
+	e.running[a.ID] = true
+	s.Attempts++
+	s.Status = "requesting"
+	if e.saveLocked() != nil {
+		s.Attempts--
+		s.Status = "pending"
+		delete(e.running, a.ID)
+		return
+	}
+	c := e.cfg.Clone()
+	e.workers.Add(1)
+	go e.attempt(a, s.Key, c)
+}
+func (e *Engine) finishLocked(s *Slot, status, reason string, now time.Time) {
+	s.Status = status
+	s.LastError = reason
+	s.CompletedAt = now
+	s.NextAttempt = time.Time{}
+}
+func (e *Engine) attempt(a Auth, key string, c Config) {
 	defer e.workers.Done()
-	e.mu.Lock()
-	slot := e.slots[key]
-	if slot == nil {
-		delete(e.running, key)
-		e.mu.Unlock()
-		return
+	result, err := e.host.Execute(a, c)
+	now := e.now()
+	success := err == nil && result.StatusCode >= 200 && result.StatusCode < 300
+	// Query quota after every attempt, including failures; never rely on a stale window.
+	q, qerr := e.host.FetchQuota(a, now)
+	if qerr != nil {
+		q = Quota{ObservedAt: now, Error: "quota_unavailable"}
 	}
-	slot.Attempts++
-	attempt := slot.Attempts
-	slot.Status = "requesting"
-	e.saveOrLogLocked()
-	e.mu.Unlock()
-
-	result, requestErr := e.host.Execute(auth, cfg)
-	now := time.Now()
-	e.mu.Lock()
-	slot = e.slots[key]
-	if slot == nil {
-		delete(e.running, key)
-		e.mu.Unlock()
-		return
+	reset, hasReset := q.ResetAt, q.Known
+	if !hasReset && success {
+		reset, hasReset = ResetAt(result.Headers, now)
 	}
-	slot.StatusCode = result.StatusCode
-	slot.LastError = ""
-	level, event := "info", "slot_complete"
+	e.mu.Lock()
+	s := e.slots[key]
+	s.Quota = q
+	s.StatusCode = result.StatusCode
+	s.LastError = ""
 	notify := false
-	if requestErr == nil && result.StatusCode >= 200 && result.StatusCode < 300 {
-		resetAt, found := ResetAt(result.Headers, now)
-		if found {
-			slot.ResetAt = resetAt
-		}
-		switch DecideWindow(resetAt, found, now, slot.Due, slot.Deadline) {
-		case WindowWait:
-			slot.Status = string(WindowWait)
-			slot.NextAttempt = resetAt.Add(time.Duration(cfg.GraceSeconds) * time.Second)
-			if slot.NextAttempt.After(slot.Deadline) {
-				slot.Status = string(WindowAlreadyOpen)
-				slot.CompletedAt = now
-			} else {
-				event = "waiting_for_reset"
-			}
-		case WindowFresh:
-			slot.Status = string(WindowFresh)
-			slot.CompletedAt = now
-		case WindowAlreadyOpen:
-			slot.Status = string(WindowAlreadyOpen)
-			slot.CompletedAt = now
-		default:
-			slot.Status = string(WindowUnknown)
-			slot.CompletedAt = now
-		}
+	if success && (!hasReset || !reset.After(now)) {
+		e.finishLocked(s, "request_ok_reset_unknown", "", now)
+	} else if success && reset.Sub(now) >= 285*time.Minute {
+		e.finishLocked(s, "fresh_window", "", now)
 	} else {
-		status := result.StatusCode
-		if status == 0 {
-			slot.LastError = "host_callback_failed"
-		} else {
-			slot.LastError = fmt.Sprintf("http_%d", status)
+		if !success {
+			s.LastError = fmt.Sprintf("http_%d", result.StatusCode)
+			if result.StatusCode == 0 {
+				s.LastError = "host_callback_failed"
+			}
 		}
-		transient := status == 0 || status == 408 || status == 409 || status == 429 || status >= 500
-		delay := RetryDelay(cfg, attempt)
-		next := now.Add(delay)
-		if transient && attempt < cfg.RetryAttempts && !next.After(slot.Deadline) {
-			slot.Status = "retry_pending"
-			slot.NextAttempt = next
-			level, event = "warn", "retry_scheduled"
+		if s.Attempts >= 1+s.MaxRetries {
+			reason := s.LastError
+			if reason == "" {
+				reason = "window_not_activated"
+			}
+			e.finishLocked(s, "failed", reason, now)
+			notify = true
 		} else {
-			slot.Status = "failed"
-			slot.CompletedAt = now
-			level, event, notify = "error", "slot_failed", true
+			s.NextAttempt = now.Add(30 * time.Second)
+			s.Status = "retry_pending"
+			if hasReset && reset.After(now) {
+				s.NextAttempt = reset
+				s.Status = "wait_for_reset"
+			}
 		}
 	}
-	e.saveOrLogLocked()
-	delete(e.running, key)
-	fields := map[string]any{
-		"auth_id": auth.ID, "due": slot.Due.Format(time.RFC3339),
-		"status": slot.Status, "attempt": slot.Attempts,
-		"http_status": slot.StatusCode, "next_attempt": slot.NextAttempt.Format(time.RFC3339),
-	}
-	if !slot.ResetAt.IsZero() {
-		fields["reset_at"] = slot.ResetAt.Format(time.RFC3339)
-	}
-	reason := slot.LastError
+	e.logLocked(s.Status, s, now)
+	_ = e.saveLocked()
+	delete(e.running, a.ID)
+	status := s.Status
+	reason := s.LastError
 	e.mu.Unlock()
-	e.host.Log(level, event, fields)
+	e.host.Log("info", "wake_result", map[string]any{"auth_id": a.ID, "task_id": key, "status": status, "http_status": result.StatusCode})
 	if notify {
-		e.host.Notify(auth.ID, reason, cfg)
+		e.host.Notify(a.ID, reason, c)
 	}
 }
-
+func (e *Engine) logLocked(event string, s *Slot, now time.Time) {
+	e.logs = append(e.logs, LogEntry{now, event, s.AuthID, s.Key, s.Status})
+	if len(e.logs) > e.cfg.MaxLogEntries {
+		e.logs = e.logs[len(e.logs)-e.cfg.MaxLogEntries:]
+	}
+}
 func (e *Engine) Status(now time.Time) Status {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	out := Status{
-		Enabled: e.cfg.Enabled, Model: e.cfg.Model, Timezone: e.cfg.Timezone,
-		Times: append([]string(nil), e.cfg.Times...), Now: now,
+	out := Status{Enabled: e.active, Config: e.cfg.Clone(), Now: now, Auths: append([]Auth{}, e.auths...), Slots: []Slot{}, Schedules: NextRuns(e.cfg, now), StateError: e.stateError, AuthError: e.authError}
+	for _, s := range e.slots {
+		out.Slots = append(out.Slots, *s)
 	}
-	for _, slot := range e.slots {
-		out.Slots = append(out.Slots, *slot)
-	}
-	sort.Slice(out.Slots, func(i, j int) bool {
-		if out.Slots[i].Due.Equal(out.Slots[j].Due) {
-			return out.Slots[i].AuthID < out.Slots[j].AuthID
-		}
-		return out.Slots[i].Due.After(out.Slots[j].Due)
-	})
-	if len(out.Slots) > 100 {
-		out.Slots = out.Slots[:100]
-	}
+	sort.Slice(out.Slots, func(i, j int) bool { return out.Slots[i].Due.After(out.Slots[j].Due) })
 	return out
 }
-
-func (e *Engine) saveOrLogLocked() {
-	if err := e.saveLocked(); err != nil {
-		// Avoid calling the host while the engine lock is held.
-		go e.host.Log("error", "state_write_failed", map[string]any{"error_type": "file_io"})
-	}
+func (e *Engine) Logs() []LogEntry {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]LogEntry{}, e.logs...)
 }
-
 func (e *Engine) saveLocked() error {
-	if e.cfg.StateFile == "" {
-		return nil
-	}
-	cutoff := time.Now().Add(-7 * 24 * time.Hour)
-	state := diskState{Schema: 1}
-	for key, slot := range e.slots {
-		if slot.Due.Before(cutoff) {
+	state := diskState{Schema: 2, Seen: e.seen, Logs: e.logs, Slots: []*Slot{}}
+	cutoff := e.now().Add(-7 * 24 * time.Hour)
+	for key, s := range e.slots {
+		if s.Complete() && s.CompletedAt.Before(cutoff) {
 			delete(e.slots, key)
 			continue
 		}
-		state.Slots = append(state.Slots, *slot)
+		state.Slots = append(state.Slots, s)
 	}
+	err := writeState(e.cfg.StateFile, state)
+	e.stateError = ""
+	if err != nil {
+		e.stateError = "state_write_failed"
+	}
+	return err
+}
+func writeState(path string, state diskState) error {
 	raw, err := json.Marshal(state)
 	if err != nil {
 		return err
 	}
-	if err = os.MkdirAll(filepath.Dir(e.cfg.StateFile), 0o700); err != nil {
+	if err = os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return err
 	}
-	file, err := os.CreateTemp(filepath.Dir(e.cfg.StateFile), ".keeper-*.tmp")
+	f, err := os.CreateTemp(filepath.Dir(path), ".5h-reset-*.tmp")
 	if err != nil {
 		return err
 	}
-	name := file.Name()
+	name := f.Name()
 	defer os.Remove(name)
-	if err = file.Chmod(0o600); err == nil {
-		_, err = file.Write(raw)
+	if err = f.Chmod(0600); err == nil {
+		_, err = f.Write(raw)
 	}
-	if closeErr := file.Close(); err == nil {
+	if err == nil {
+		err = f.Sync()
+	}
+	closeErr := f.Close()
+	if err == nil {
 		err = closeErr
 	}
 	if err != nil {
 		return err
 	}
-	return os.Rename(name, e.cfg.StateFile)
+	return os.Rename(name, path)
 }
-
-func loadState(path string) (map[string]*Slot, error) {
-	out := make(map[string]*Slot)
+func loadState(path string, maxRetries int) (diskState, error) {
+	state := diskState{Schema: 2, Seen: map[string]string{}}
 	raw, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return out, nil
+		return state, nil
 	}
 	if err != nil {
-		return nil, err
+		return state, errors.New("state_read_failed")
 	}
-	var state diskState
-	if err = json.Unmarshal(raw, &state); err != nil {
-		return nil, err
+	if json.Unmarshal(raw, &state) != nil {
+		return state, errors.New("invalid state JSON")
 	}
-	if state.Schema != 1 {
-		return nil, fmt.Errorf("unsupported state schema %d", state.Schema)
+	if state.Schema != 1 && state.Schema != 2 {
+		return state, errors.New("unsupported state schema")
 	}
-	for _, slot := range state.Slots {
-		copy := slot
-		out[slot.Key] = &copy
+	if state.Seen == nil {
+		state.Seen = map[string]string{}
 	}
-	return out, nil
+	active := map[string]bool{}
+	for _, s := range state.Slots {
+		if s == nil || s.Key == "" || s.AuthID == "" {
+			return state, errors.New("invalid state task")
+		}
+		if state.Schema == 1 {
+			s.MaxRetries = maxRetries
+		}
+		if !s.Complete() {
+			if active[s.AuthID] {
+				s.Status = "cancelled"
+				s.CompletedAt = time.Now()
+				s.LastError = "duplicate_legacy_task"
+			} else {
+				active[s.AuthID] = true
+				if s.Status == "requesting" {
+					s.Status = "retry_pending"
+				}
+			}
+		}
+	}
+	state.Schema = 2
+	return state, nil
 }
-
-// WaitForIdle is useful for deterministic tests; production uses asynchronous
-// workers so unrelated account attempts can run at the same time.
 func (e *Engine) WaitForIdle(ctx context.Context) error {
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
 	for {
 		e.mu.Lock()
 		idle := len(e.running) == 0
@@ -408,7 +521,7 @@ func (e *Engine) WaitForIdle(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-ticker.C:
+		case <-time.After(time.Millisecond):
 		}
 	}
 }

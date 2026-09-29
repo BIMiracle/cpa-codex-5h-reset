@@ -1,4 +1,4 @@
-module github.com/example/cpa-codex-window-keeper
+module github.com/BIMiracle/cpa-codex-5h-reset
 
 go 1.26.0
 

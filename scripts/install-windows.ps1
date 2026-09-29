@@ -2,14 +2,14 @@ param(
     [Parameter(Mandatory = $true)][string]$ReleaseZip,
     [Parameter(Mandatory = $true)][string]$ChecksumsFile,
     [string]$StableRoot = "$env:LOCALAPPDATA\CLIProxyAPI",
-    [string]$ExistingPluginsDir = 'C:\software\CLIProxyAPI\plugins'
+    [string]$ExistingPluginsDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
 $zipPath = (Resolve-Path -LiteralPath $ReleaseZip).Path
 $checksumPath = (Resolve-Path -LiteralPath $ChecksumsFile).Path
 $name = [IO.Path]::GetFileName($zipPath)
-if ($name -notmatch '^cpa-codex-window-keeper_(\d+\.\d+\.\d+)_windows_amd64\.zip$') {
+if ($name -notmatch '^cpa-codex-5h-reset_(\d+\.\d+\.\d+)_windows_amd64\.zip$') {
     throw "Unexpected release filename: $name"
 }
 $version = $Matches[1]
@@ -31,8 +31,8 @@ New-Item -ItemType Directory -Path (Join-Path $StableRoot 'state') -Force | Out-
 New-Item -ItemType Directory -Path (Join-Path $StableRoot 'scripts') -Force | Out-Null
 
 # Keep existing CPA plugins usable when plugins.dir is changed to StableRoot.
-$oldPlatform = Join-Path $ExistingPluginsDir 'windows\amd64'
-if (Test-Path -LiteralPath $oldPlatform) {
+$oldPlatform = if ($ExistingPluginsDir) { Join-Path $ExistingPluginsDir 'windows\amd64' } else { '' }
+if ($ExistingPluginsDir -and (Test-Path -LiteralPath $oldPlatform)) {
     Get-ChildItem -LiteralPath $oldPlatform -Filter '*.dll' -File | ForEach-Object {
         $target = Join-Path $destination $_.Name
         if (-not (Test-Path -LiteralPath $target)) {
@@ -44,10 +44,10 @@ if (Test-Path -LiteralPath $oldPlatform) {
 $archive = [IO.Compression.ZipFile]::OpenRead($zipPath)
 try {
     $entry = $archive.Entries |
-        Where-Object { $_.FullName -eq 'cpa-codex-window-keeper.dll' } |
+        Where-Object { $_.FullName -eq 'cpa-codex-5h-reset.dll' } |
         Select-Object -First 1
     if (-not $entry) { throw 'Release ZIP does not contain the expected DLL at its root.' }
-    $targetDLL = Join-Path $destination "cpa-codex-window-keeper-v$version.dll"
+    $targetDLL = Join-Path $destination "cpa-codex-5h-reset-v$version.dll"
     $source = $entry.Open()
     try {
         $output = [IO.File]::Create($targetDLL)
@@ -55,11 +55,6 @@ try {
     } finally { $source.Dispose() }
 } finally { $archive.Dispose() }
 
-$notificationSource = Join-Path $PSScriptRoot 'notify-failure.ps1'
-$notificationTarget = Join-Path $StableRoot 'scripts\notify-failure.ps1'
-Copy-Item -LiteralPath $notificationSource -Destination $notificationTarget -Force
-
 Write-Host "Installed $targetDLL"
-Write-Host "Copied notification script to $notificationTarget"
 Write-Host "Set plugins.dir to $(Join-Path $StableRoot 'plugins') in CPA config.yaml,"
 Write-Host 'add the plugin configuration from README.md, then restart CPA.'
