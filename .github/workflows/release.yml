@@ -1,74 +1,92 @@
-name: Build Windows CPA plugin
-
+name: Build CPA plugin
 on:
   push:
-    tags:
-      - 'v*'
+    tags: ["v*"]
+  pull_request:
   workflow_dispatch:
-
 permissions:
   contents: read
-
 jobs:
-  verify:
-    runs-on: ubuntu-latest
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04, goos: linux, goarch: amd64, ext: so }
+          - { os: ubuntu-24.04-arm, goos: linux, goarch: arm64, ext: so }
+          - { os: macos-15-intel, goos: darwin, goarch: amd64, ext: dylib }
+          - { os: macos-15, goos: darwin, goarch: arm64, ext: dylib }
+          - { os: windows-2025, goos: windows, goarch: amd64, ext: dll }
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
-      - run: go test ./...
-      - run: go vet ./...
-
-  release:
-    needs: verify
-    runs-on: windows-2025
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-node@v4
         with:
-          go-version-file: go.mod
-          cache: true
+          node-version: "22"
       - uses: msys2/setup-msys2@v2
+        id: msys2
+        if: runner.os == 'Windows'
         with:
           msystem: MINGW64
           path-type: inherit
           update: true
           install: mingw-w64-x86_64-gcc
-      - name: Build and package
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $version = '${{ github.ref_name }}' -replace '^v', ''
-          $id = 'cpa-codex-window-keeper'
-          $dll = Join-Path $PWD "$id.dll"
-          $zip = Join-Path $PWD "$($id)_$($version)_windows_amd64.zip"
-          $env:CGO_ENABLED = '1'
-          $env:GOOS = 'windows'
-          $env:GOARCH = 'amd64'
-          $env:CC = 'C:\msys64\mingw64\bin\gcc.exe'
-          go build -trimpath -buildmode=c-shared -ldflags='-s -w' -o $dll .
-          if ($LASTEXITCODE -ne 0) { throw 'go build failed' }
-          Compress-Archive -LiteralPath $dll -DestinationPath $zip -Force
-          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant()
-          "$hash  $(Split-Path $zip -Leaf)" | Set-Content -Path checksums.txt -Encoding ascii
-      - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Test and build
         shell: pwsh
         env:
-          GH_TOKEN: ${{ github.token }}
+          CGO_ENABLED: "1"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          PLUGIN_EXT: ${{ matrix.ext }}
+          MSYS2_LOCATION: ${{ steps.msys2.outputs.msys2-location }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $assets = @(Get-ChildItem -File -Filter 'cpa-codex-window-keeper_*.zip' | ForEach-Object { $_.FullName })
-          $assets += (Resolve-Path -LiteralPath '.\checksums.txt').Path
-          gh release create '${{ github.ref_name }}' @assets --repo '${{ github.repository }}' --verify-tag --generate-notes
-          if ($LASTEXITCODE -ne 0) { throw 'GitHub release failed' }
+          if ($env:GOOS -eq 'windows') {
+            $compilerDir = Join-Path $env:MSYS2_LOCATION 'mingw64\bin'
+            $env:CC = Join-Path $compilerDir 'gcc.exe'
+            $env:PATH = $compilerDir + ';' + $env:PATH
+          }
+          go test -race ./...
+          if ($LASTEXITCODE -ne 0) { throw 'Tests failed' }
+          go vet ./...
+          if ($LASTEXITCODE -ne 0) { throw 'Vet failed' }
+          node --test web/app.test.cjs
+          if ($LASTEXITCODE -ne 0) { throw 'Browser logic tests failed' }
+          $version = '0.2.0'
+          if ($env:GITHUB_REF_TYPE -eq 'tag') { $version = $env:GITHUB_REF_NAME -replace '^v', '' }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $library = "dist/cpa-codex-5h-reset.$env:PLUGIN_EXT"
+          go build -trimpath -buildmode=c-shared "-ldflags=-s -w -X main.pluginVersion=$version" -o $library .
+          if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+          python scripts/abi-smoke.py $library
+          if ($LASTEXITCODE -ne 0) { throw 'ABI smoke failed' }
+          $zip = "dist/cpa-codex-5h-reset_${version}_$($env:GOOS)_$($env:GOARCH).zip"
+          Compress-Archive -LiteralPath $library -DestinationPath $zip
       - uses: actions/upload-artifact@v4
         with:
-          name: windows-amd64-plugin
-          path: |
-            cpa-codex-window-keeper_*.zip
-            checksums.txt
+          name: plugin-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*.zip
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: plugin-*
+          path: dist
+          merge-multiple: true
+      - name: Publish verified artifacts
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          sha256sum *.zip > checksums.txt
+          gh release create "$GITHUB_REF_NAME" ./*.zip checksums.txt --verify-tag --generate-notes

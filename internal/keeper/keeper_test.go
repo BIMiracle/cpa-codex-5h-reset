@@ -2,184 +2,315 @@ package keeper
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
 	"path/filepath"
-	"strconv"
 	"sync"
 	"testing"
 	"time"
 )
 
-func TestResetAtAndWindowDecision(t *testing.T) {
-	now := time.Date(2026, 9, 29, 15, 2, 0, 0, time.FixedZone("SGT", 8*3600))
-	due := now
-	deadline := now.Add(3 * time.Hour)
-	headers := http.Header{}
-	headers.Set("X-Codex-Primary-Reset-At", "1790665500")
-	reset, found := ResetAt(headers, now)
-	if !found || reset.Unix() != 1790665500 {
-		t.Fatalf("absolute reset header: %v, %v", reset, found)
-	}
-	reset = now.Add(13 * time.Minute)
-	if got := DecideWindow(reset, true, now, due, deadline); got != WindowWait {
-		t.Fatalf("old window with imminent reset: %s", got)
-	}
-	if got := DecideWindow(now.Add(5*time.Hour), true, now, due, deadline); got != WindowFresh {
-		t.Fatalf("new window: %s", got)
-	}
-	if got := DecideWindow(now.Add(4*time.Hour), true, now, due, deadline); got != WindowAlreadyOpen {
-		t.Fatalf("old window beyond deadline: %s", got)
-	}
-	if got := DecideWindow(time.Time{}, false, now, due, deadline); got != WindowUnknown {
-		t.Fatalf("missing reset signal: %s", got)
-	}
-}
-
 type fakeHost struct {
 	mu       sync.Mutex
 	auths    []Auth
-	results  []Execution
-	byID     map[string][]Execution
+	codes    map[string][]int
+	quotas   map[string][]Quota
+	calls    map[string]int
 	notified int
+	clock    time.Time
+	listErr  bool
 }
 
-func (h *fakeHost) ListAuths() ([]Auth, error) { return h.auths, nil }
-func (h *fakeHost) Execute(auth Auth, _ Config) (Execution, error) {
+func (h *fakeHost) ListAuths() ([]Auth, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.byID != nil {
-		results := h.byID[auth.ID]
-		if len(results) == 0 {
-			return Execution{}, errors.New("unexpected credential request")
-		}
-		h.byID[auth.ID] = results[1:]
-		return results[0], nil
+	if h.listErr {
+		return nil, errors.New("secret error")
 	}
-	if len(h.results) == 0 {
-		return Execution{}, errors.New("unexpected extra request")
-	}
-	result := h.results[0]
-	h.results = h.results[1:]
-	return result, nil
+	return append([]Auth{}, h.auths...), nil
 }
-
-func TestAccountsProgressIndependently(t *testing.T) {
-	now := time.Now()
-	cfg := Defaults()
-	cfg.Enabled = true
-	cfg.StateFile = filepath.Join(t.TempDir(), "state.json")
-	cfg.Times = []string{now.In(mustLocation(t, cfg.Timezone)).Format("15:04")}
-	cfg.RetryInitialSeconds = 1
-	cfg.RetryMaxSeconds = 2
-	cfg.MaxDelayMinutes = 10
-	fresh := Execution{StatusCode: 200, Headers: http.Header{
-		"X-Codex-Primary-Reset-At": []string{strconv.FormatInt(now.Add(5*time.Hour).Unix(), 10)},
-	}}
-	h := &fakeHost{
-		auths: []Auth{{ID: "a", Provider: "codex"}, {ID: "b", Provider: "codex"}},
-		byID: map[string][]Execution{
-			"a": {{StatusCode: 500}, fresh},
-			"b": {fresh},
-		},
-	}
-	e := New(h)
-	if err := e.Configure(cfg); err != nil {
-		t.Fatal(err)
-	}
-	defer e.Stop()
-	e.Tick(now)
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	if err := e.WaitForIdle(ctx); err != nil {
-		t.Fatal(err)
-	}
-	byAuth := map[string]Slot{}
-	for _, slot := range e.Status(time.Now()).Slots {
-		byAuth[slot.AuthID] = slot
-	}
-	if byAuth["a"].Status != "retry_pending" || byAuth["b"].Status != string(WindowFresh) {
-		t.Fatalf("account states after first attempt: %+v", byAuth)
-	}
-	e.Tick(byAuth["a"].NextAttempt.Add(time.Millisecond))
-	if err := e.WaitForIdle(ctx); err != nil {
-		t.Fatal(err)
-	}
-	byAuth = map[string]Slot{}
-	for _, slot := range e.Status(time.Now()).Slots {
-		byAuth[slot.AuthID] = slot
-	}
-	if byAuth["a"].Status != string(WindowFresh) || byAuth["b"].Attempts != 1 {
-		t.Fatalf("account states after retry: %+v", byAuth)
-	}
-}
-func (h *fakeHost) Log(_, _ string, _ map[string]any) {}
-func (h *fakeHost) Notify(_, _ string, _ Config) {
+func (h *fakeHost) Execute(a Auth, _ Config) (Execution, error) {
 	h.mu.Lock()
-	h.notified++
-	h.mu.Unlock()
+	defer h.mu.Unlock()
+	h.calls[a.ID]++
+	code := 500
+	if len(h.codes[a.ID]) > 0 {
+		code = h.codes[a.ID][0]
+		h.codes[a.ID] = h.codes[a.ID][1:]
+	}
+	return Execution{StatusCode: code, Headers: http.Header{}}, nil
 }
-
-func TestPerCredentialHTTP500RetryAndPersistence(t *testing.T) {
-	now := time.Now()
-	cfg := Defaults()
-	cfg.Enabled = true
-	cfg.StateFile = filepath.Join(t.TempDir(), "state.json")
-	cfg.RetryInitialSeconds = 1
-	cfg.RetryMaxSeconds = 2
-	cfg.MaxDelayMinutes = 10
-	cfg.Times = []string{now.In(mustLocation(t, cfg.Timezone)).Format("15:04")}
-	h := &fakeHost{
-		auths: []Auth{{ID: "account-a", Provider: "codex"}},
-		results: []Execution{
-			{StatusCode: 500},
-			{StatusCode: 200, Headers: http.Header{}},
-		},
-	}
-	// The response header is a Unix timestamp; use an actual epoch value.
-	h.results[1].Headers.Set("X-Codex-Primary-Reset-At",
-		strconv.FormatInt(now.Add(5*time.Hour).Unix(), 10))
-	e := New(h)
-	if err := e.Configure(cfg); err != nil {
-		t.Fatal(err)
-	}
-	defer e.Stop()
-	e.Tick(now)
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	if err := e.WaitForIdle(ctx); err != nil {
-		t.Fatal(err)
-	}
-	slots := e.Status(time.Now()).Slots
-	if len(slots) != 1 || slots[0].Status != "retry_pending" || slots[0].Attempts != 1 {
-		t.Fatalf("after 500: %+v", slots)
-	}
-	// Advance the scheduler clock past its next attempt without sleeping.
-	e.Tick(slots[0].NextAttempt.Add(time.Millisecond))
-	if err := e.WaitForIdle(ctx); err != nil {
-		t.Fatal(err)
-	}
-	slots = e.Status(time.Now()).Slots
-	if slots[0].Status != string(WindowFresh) || slots[0].Attempts != 2 || !slots[0].Complete() {
-		t.Fatalf("after retry: %+v", slots[0])
-	}
+func (h *fakeHost) FetchQuota(a Auth, now time.Time) (Quota, error) {
 	h.mu.Lock()
-	notified := h.notified
-	h.mu.Unlock()
-	if notified != 0 {
-		t.Fatalf("unexpected notification count %d", notified)
+	defer h.mu.Unlock()
+	if len(h.quotas[a.ID]) == 0 {
+		return Quota{}, errors.New("secret token")
 	}
-	stored, err := loadState(cfg.StateFile)
-	if err != nil || len(stored) != 1 {
-		t.Fatalf("persistent state: %v, %v", stored, err)
-	}
+	q := h.quotas[a.ID][0]
+	h.quotas[a.ID] = h.quotas[a.ID][1:]
+	q.ObservedAt = now
+	return q, nil
 }
-
-func mustLocation(t *testing.T, name string) *time.Location {
+func (h *fakeHost) Log(string, string, map[string]any) {}
+func (h *fakeHost) Notify(string, string, Config)      { h.mu.Lock(); h.notified++; h.mu.Unlock() }
+func (h *fakeHost) now() time.Time                     { h.mu.Lock(); defer h.mu.Unlock(); return h.clock }
+func (h *fakeHost) advance(t time.Time)                { h.mu.Lock(); h.clock = t; h.mu.Unlock() }
+func fixture(t *testing.T) (*Engine, *fakeHost, Config) {
 	t.Helper()
-	loc, err := time.LoadLocation(name)
+	h := &fakeHost{auths: []Auth{{ID: "a", Provider: "codex"}, {ID: "b", Provider: "codex"}}, codes: map[string][]int{}, quotas: map[string][]Quota{}, calls: map[string]int{}, clock: time.Date(2026, 9, 29, 7, 2, 0, 0, time.UTC)}
+	e := New(h)
+	e.now = h.now
+	c := Defaults()
+	c.Schedules = []Schedule{}
+	c.StateFile = filepath.Join(t.TempDir(), "state.json")
+	if err := e.Configure(c); err != nil {
+		t.Fatal(err)
+	}
+	e.mu.Lock()
+	e.active = true
+	e.mu.Unlock()
+	t.Cleanup(e.Stop)
+	return e, h, c
+}
+func idle(t *testing.T, e *Engine) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
+	defer cancel()
+	if err := e.WaitForIdle(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+func slot(t *testing.T, e *Engine, id string) Slot {
+	t.Helper()
+	for _, s := range e.Status(e.now()).Slots {
+		if s.AuthID == id {
+			return s
+		}
+	}
+	t.Fatal("missing slot")
+	return Slot{}
+}
+func TestWaitResetThenThreeRetries(t *testing.T) {
+	e, h, _ := fixture(t)
+	start := h.now()
+	reset := start.Add(13 * time.Minute)
+	h.quotas["a"] = []Quota{{Known: true, ResetAt: reset}, {Known: true, ResetAt: reset}, {Known: true, ResetAt: reset}}
+	_, err := e.Manual("a", start)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return loc
+	idle(t, e)
+	if s := slot(t, e, "a"); s.Status != "wait_for_reset" || !s.NextAttempt.Equal(reset) {
+		t.Fatalf("%+v", s)
+	}
+	h.advance(reset.Add(-time.Second))
+	e.Tick(h.now())
+	idle(t, e)
+	if slot(t, e, "a").Attempts != 1 {
+		t.Fatal("early request")
+	}
+	for i := 0; i < 3; i++ {
+		h.advance(reset.Add(time.Duration(i) * 30 * time.Second))
+		e.Tick(h.now())
+		idle(t, e)
+	}
+	s := slot(t, e, "a")
+	if s.Attempts != 4 || s.Status != "failed" || h.notified != 1 {
+		t.Fatalf("%+v notifications %d", s, h.notified)
+	}
+	h.advance(reset.Add(time.Hour))
+	e.Tick(h.now())
+	idle(t, e)
+	if h.calls["a"] != 4 || h.notified != 1 {
+		t.Fatal("repeated terminal task")
+	}
+}
+func TestIndependentManualAndUnknownQuota(t *testing.T) {
+	e, h, _ := fixture(t)
+	h.codes["b"] = []int{200}
+	_, err := e.Manual("", h.now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	idle(t, e)
+	a, b := slot(t, e, "a"), slot(t, e, "b")
+	if a.Status != "retry_pending" || a.NextAttempt.Sub(h.now()) != 30*time.Second || b.Status != "request_ok_reset_unknown" {
+		t.Fatalf("%+v %+v", a, b)
+	}
+	if _, err = e.Manual("", h.now()); !errors.Is(err, ErrConflict) {
+		t.Fatal(err)
+	}
+	h.codes["a"] = []int{200}
+	h.advance(a.NextAttempt)
+	e.Tick(h.now())
+	idle(t, e)
+	if slot(t, e, "a").Attempts != 2 || h.calls["b"] != 1 {
+		t.Fatal("independence/manual retry")
+	}
+}
+func TestZeroRetries(t *testing.T) {
+	e, h, _ := fixture(t)
+	e.cfg.MaxRetries = 0
+	_, _ = e.Manual("a", h.now())
+	idle(t, e)
+	s := slot(t, e, "a")
+	if s.Attempts != 1 || s.Status != "failed" || h.notified != 1 {
+		t.Fatalf("%+v", s)
+	}
+}
+func TestRestartAndConfigKeepsBudget(t *testing.T) {
+	e, h, c := fixture(t)
+	_, _ = e.Manual("a", h.now())
+	idle(t, e)
+	s := slot(t, e, "a")
+	e.Stop()
+	c.MaxRetries = 9
+	re := New(h)
+	re.now = h.now
+	if err := re.Configure(c); err != nil {
+		t.Fatal(err)
+	}
+	defer re.Stop()
+	re.active = true
+	h.advance(s.NextAttempt)
+	re.Tick(h.now())
+	idle(t, re)
+	after := slot(t, re, "a")
+	if after.Attempts != 2 || after.MaxRetries != 3 {
+		t.Fatalf("%+v", after)
+	}
+	if err := re.Configure(c); err != nil {
+		t.Fatal(err)
+	}
+	re.active = true
+	h.advance(after.NextAttempt)
+	re.Tick(h.now())
+	idle(t, re)
+	if slot(t, re, "a").Attempts != 3 {
+		t.Fatal("reconfiguration lost task")
+	}
+}
+func TestScheduleMergeAndCredentialRemoval(t *testing.T) {
+	e, h, _ := fixture(t)
+	e.cfg.Schedules = []Schedule{{"test", "15:02", true}}
+	_, _ = e.Manual("a", h.now())
+	idle(t, e)
+	e.Tick(h.now())
+	idle(t, e)
+	count := 0
+	for _, s := range e.Status(h.now()).Slots {
+		if s.AuthID == "a" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatal("schedule duplicated pending task")
+	}
+	h.mu.Lock()
+	h.auths[0].Disabled = true
+	h.mu.Unlock()
+	e.Tick(h.now())
+	idle(t, e)
+	if slot(t, e, "a").Status != "cancelled" {
+		t.Fatal("disabled credential ran")
+	}
+}
+func TestFutureResetMovesWithoutResettingBudget(t *testing.T) {
+	e, h, _ := fixture(t)
+	now := h.now()
+	h.quotas["a"] = []Quota{{Known: true, ResetAt: now.Add(time.Minute)}, {Known: true, ResetAt: now.Add(5 * time.Hour)}}
+	_, _ = e.Manual("a", now)
+	idle(t, e)
+	h.advance(now.Add(time.Minute))
+	e.Tick(h.now())
+	idle(t, e)
+	s := slot(t, e, "a")
+	if s.Attempts != 2 || !s.NextAttempt.Equal(now.Add(5*time.Hour)) {
+		t.Fatalf("%+v", s)
+	}
+}
+func TestSuccessOldWindow(t *testing.T) {
+	e, h, _ := fixture(t)
+	now := h.now()
+	h.codes["a"] = []int{200, 200}
+	h.quotas["a"] = []Quota{{Known: true, ResetAt: now.Add(time.Minute)}, {Known: true, ResetAt: now.Add(301 * time.Minute)}}
+	_, _ = e.Manual("a", now)
+	idle(t, e)
+	if slot(t, e, "a").Status != "wait_for_reset" {
+		t.Fatal("old window ignored")
+	}
+	h.advance(now.Add(time.Minute))
+	e.Tick(h.now())
+	idle(t, e)
+	if slot(t, e, "a").Status != "fresh_window" {
+		t.Fatal("new window not recognized")
+	}
+}
+func TestQuotaParsing(t *testing.T) {
+	now := time.Now()
+	for _, tc := range []struct {
+		body  string
+		known bool
+	}{{`{"rate_limit":{"primary_window":{"limit_window_seconds":604800,"reset_at":1800000000}}}`, false}, {`{"rate_limit":{"primary_window":{"limit_window_seconds":604800,"reset_at":1800000000},"secondary_window":{"limit_window_seconds":18000,"reset_at":1790665500,"used_percent":25}}}`, true}, {`{"rate_limit":{"primary_window":{"limit_window_seconds":18000,"reset_after_seconds":30}}}`, true}, {`{"rate_limit":{"primary_window":{"reset_at":1800000000}}}`, false}, {`bad`, false}} {
+		q, err := ParseQuota([]byte(tc.body), now)
+		if q.Known != tc.known || (err == nil) != tc.known {
+			t.Fatalf("%s: %+v %v", tc.body, q, err)
+		}
+	}
+}
+func TestConfigAndNextRuns(t *testing.T) {
+	c := Defaults()
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	c.Schedules = []Schedule{}
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if len(NextRuns(c, time.Now())) != 0 {
+		t.Fatal("empty schedules")
+	}
+	c.Schedules = []Schedule{{"a", "05:00", true}, {"b", "05:00", true}}
+	if c.Validate() == nil {
+		t.Fatal("duplicate time accepted")
+	}
+	c = Defaults()
+	now := time.Date(2026, 9, 29, 15, 59, 0, 0, time.UTC)
+	for _, s := range NextRuns(c, now) {
+		if !s.Time.After(now) {
+			t.Fatal("past next run")
+		}
+	}
+	c.MaxRetries = -1
+	if c.Validate() == nil {
+		t.Fatal("negative retries")
+	}
+}
+func TestStateMigrationAndFailure(t *testing.T) {
+	e, h, c := fixture(t)
+	_, _ = e.Manual("a", h.now())
+	idle(t, e)
+	e.Stop()
+	raw, err := os.ReadFile(c.StateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state diskState
+	if json.Unmarshal(raw, &state) != nil {
+		t.Fatal("state")
+	}
+	state.Schema = 1
+	state.Slots[0].MaxRetries = 0
+	data, _ := json.Marshal(state)
+	_ = os.WriteFile(c.StateFile, data, 0600)
+	migrated, err := loadState(c.StateFile, 3)
+	if err != nil || migrated.Slots[0].MaxRetries != 3 {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(c.StateFile, []byte(`{"schema":999}`), 0600)
+	if _, err = loadState(c.StateFile, 3); err == nil {
+		t.Fatal("unknown schema accepted")
+	}
 }

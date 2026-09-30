@@ -24,8 +24,9 @@ typedef struct {
 extern int keeperPluginCall(char*, uint8_t*, size_t, cliproxy_buffer*);
 extern void keeperPluginFree(void*, size_t);
 extern void keeperPluginShutdown(void);
+static cliproxy_host_api host_copy;
 static const cliproxy_host_api* stored_host;
-static void store_host_api(const cliproxy_host_api* host) { stored_host = host; }
+static void store_host_api(const cliproxy_host_api* host) { host_copy = *host; stored_host = &host_copy; }
 static int call_host_api(const char* method, const uint8_t* request, size_t request_len, cliproxy_buffer* response) {
     if (stored_host == NULL || stored_host->call == NULL) return 1;
     return stored_host->call(stored_host->host_ctx, method, request, request_len, response);
@@ -40,17 +41,13 @@ import "C"
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
-	"net/http"
-	"strings"
-	"time"
+
 	"unsafe"
 
-	"github.com/example/cpa-codex-window-keeper/internal/keeper"
-	"gopkg.in/yaml.v3"
+	"github.com/BIMiracle/cpa-codex-5h-reset/internal/keeper"
 )
 
-const pluginID = "cpa-codex-window-keeper"
+const pluginID = "cpa-codex-5h-reset"
 
 var engine = keeper.New(host{})
 
@@ -169,95 +166,4 @@ func callHost(method string, payload any) (json.RawMessage, error) {
 		return nil, callbackError{}
 	}
 	return reply.Result, nil
-}
-
-type lifecycleRequest struct {
-	ConfigYAML []byte `json:"config_yaml"`
-}
-type managementRequest struct {
-	Method string `json:"Method"`
-	Path   string `json:"Path"`
-	Body   []byte `json:"Body"`
-}
-type managementResponse struct {
-	StatusCode int         `json:"StatusCode"`
-	Headers    http.Header `json:"Headers"`
-	Body       []byte      `json:"Body"`
-}
-
-func handleMethod(method string, raw []byte) ([]byte, error) {
-	switch method {
-	case "plugin.register", "plugin.reconfigure":
-		var req lifecycleRequest
-		if err := json.Unmarshal(raw, &req); err != nil {
-			return nil, err
-		}
-		cfg := keeper.Defaults()
-		if len(req.ConfigYAML) > 0 {
-			decoder := yaml.NewDecoder(strings.NewReader(string(req.ConfigYAML)))
-			if err := decoder.Decode(&cfg); err != nil {
-				return nil, fmt.Errorf("plugin config: %w", err)
-			}
-		}
-		if err := engine.Configure(cfg); err != nil {
-			return nil, err
-		}
-		return okEnvelope(map[string]any{
-			"schema_version": 6,
-			"metadata": map[string]any{
-				"Name": "Codex Window Keeper", "Version": "0.1.0", "Author": "Community",
-				"ConfigFields": []map[string]any{
-					{"Name": "model", "Type": "string", "Description": "Codex model for wake requests"},
-					{"Name": "reasoning_effort", "Type": "string", "Description": "Reasoning effort; low is the light setting"},
-					{"Name": "timezone", "Type": "string", "Description": "IANA timezone"},
-					{"Name": "times", "Type": "array", "Description": "Daily target times in HH:MM"},
-				},
-			},
-			"capabilities": map[string]any{"management_api": true},
-		})
-	case "plugin.quiesce", "plugin.shutdown":
-		engine.Stop()
-		return okEnvelope(map[string]any{})
-	case "management.register":
-		return okEnvelope(map[string]any{"routes": []map[string]string{
-			{"Method": "GET", "Path": "/plugins/" + pluginID + "/status"},
-			{"Method": "POST", "Path": "/plugins/" + pluginID + "/run"},
-		}})
-	case "management.handle":
-		var req managementRequest
-		if err := json.Unmarshal(raw, &req); err != nil {
-			return nil, err
-		}
-		switch {
-		case req.Method == http.MethodGet && strings.HasSuffix(req.Path, "/status"):
-			return jsonManagement(http.StatusOK, engine.Status(time.Now()))
-		case req.Method == http.MethodPost && strings.HasSuffix(req.Path, "/run"):
-			var input struct {
-				AuthID string `json:"auth_id"`
-			}
-			if len(req.Body) > 0 {
-				if err := json.Unmarshal(req.Body, &input); err != nil {
-					return jsonManagement(http.StatusBadRequest, map[string]string{"error": "invalid_json"})
-				}
-			}
-			keys, err := engine.Manual(input.AuthID, time.Now())
-			if err != nil {
-				return jsonManagement(http.StatusBadRequest, map[string]string{"error": err.Error()})
-			}
-			return jsonManagement(http.StatusAccepted, map[string]any{"queued": keys})
-		default:
-			return jsonManagement(http.StatusNotFound, map[string]string{"error": "route_not_found"})
-		}
-	default:
-		return errorEnvelope("unknown_method", "unsupported plugin method", 0), nil
-	}
-}
-
-func jsonManagement(status int, value any) ([]byte, error) {
-	body, err := json.Marshal(value)
-	if err != nil {
-		return nil, err
-	}
-	return okEnvelope(managementResponse{StatusCode: status,
-		Headers: http.Header{"Content-Type": []string{"application/json; charset=utf-8"}}, Body: body})
 }
