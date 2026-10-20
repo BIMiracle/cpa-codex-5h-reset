@@ -73,6 +73,8 @@ See the [detailed guide (Chinese)](docs/guide.zh-CN.md) for full configuration, 
 
 ## Route new sessions by remaining quota (v0.3.0)
 
+Use a v0.3.0 source build or matching package for this feature. Until its Release is published, the store continues to point to the last published build.
+
 Enable **“新会话优先使用五小时剩余额度更多的账号”** on the plugin page and save. This is opt-in so existing installations keep their current scheduler until configured.
 
 - New Codex sessions choose the lowest five-hour used percentage among available credentials in the highest priority tier. Equal percentages use round-robin.
