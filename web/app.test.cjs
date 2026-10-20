@@ -51,6 +51,12 @@ function setup({
     priority: 7,
     store: { version: "0.2.0" },
     custom: "preserve",
+    quota_routing: {
+      enabled: true,
+      session_ttl: "4h",
+      bindings: [{ key: "dedicated-key", allow: ["a.json"] }],
+      unbound: "deny",
+    },
     model: "gpt-6-luna",
     reasoning_effort: "low",
     timezone: "Asia/Singapore",
@@ -164,4 +170,19 @@ test("config authentication failure leaves editing disabled", async () => {
   await settle();
   assert.equal(x.$("fields").disabled, true);
   assert.match(x.$("notice").textContent, /管理密钥无效/);
+});
+
+test("quota routing toggle preserves key isolation and TTL settings", async () => {
+  const x = setup();
+  x.$("connect").onclick();
+  await settle();
+  assert.equal(x.$("quota-routing").checked, true);
+  x.$("quota-routing").checked = false;
+  await x.$("settings").onsubmit({ preventDefault() {} });
+  const save = x.sent.find((s) => s.options.method === "PUT");
+  const routing = JSON.parse(save.options.body).quota_routing;
+  assert.equal(routing.enabled, false);
+  assert.equal(routing.session_ttl, "4h");
+  assert.equal(routing.unbound, "deny");
+  assert.deepEqual(routing.bindings, [{ key: "dedicated-key", allow: ["a.json"] }]);
 });

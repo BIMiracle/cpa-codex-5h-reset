@@ -71,6 +71,44 @@ Linux 预编译包依赖 glibc；Alpine/musl 需自行构建。手动安装的�
 
 完整配置、重试规则、管理 API、旧版迁移、构建与排障见[详细指南](docs/guide.zh-CN.md)。容器部署请将 `state_file` 指向持久卷中的可写路径。
 
+## 按额度分配新会话（v0.3.0）
+
+可在插件页面勾选 **“新会话优先使用五小时剩余额度更多的账号”**，保存后启用。默认关闭以保持已有安装的分配方式；启用后由本插件提供 CPA 的 `scheduler.pick` 调度能力：
+
+- **新会话**：在 CPA 提供的可用 Codex 账号中，先遵守账号优先级，再选择五小时已用百分比最低的账号。额度相同则轮询。
+- **已有会话**：继续使用已绑定账号，即使其他账号的余量后来变多。原账号不可用时，在剩余候选中重新选择并更新绑定。
+- **缓存与恢复**：额度默认缓存 1 分钟，窗口到期后重新查询；会话绑定默认保留至最后一次请求后 4 小时，并持久化以支持重启恢复。查询失败视为未知；优先使用额度已知且未耗尽的账号，全部未知时轮询。
+- **范围**：唤醒请求仍遵守指定 `auth_id`；非 Codex 请求和没有稳定会话标识的普通请求交还 CPA。路由账号池独立于定时唤醒的 `auth_ids`。
+
+也可在 CPA 配置的 `plugins.configs.cpa-codex-5h-reset` 中添加：
+
+```yaml
+quota_routing:
+  enabled: true
+  session_ttl: 4h
+  quota_cache_ttl: 1m
+  # state_file: /persistent/path/routing.json  # 默认 state_file + ".routing.json"
+```
+
+**使用 `key-account-bind` 时先迁移规则。** CPA 只使用最高优先级的一个调度插件，不能将两个调度器串联。将原插件的对象形式 `bindings` 和 `unbound` 复制到本插件的 `quota_routing` 中，再禁用原调度插件，并确保本插件的 `priority` 高于其他调度器。例如：
+
+```yaml
+quota_routing:
+  enabled: true
+  bindings:
+    - key: "下游专用 Key A"
+      allow: ["codex-account-a.json"]
+    - key: "下游专用 Key B"
+      allow: ["codex-account-b.json"]
+  unbound: passthrough
+```
+
+绑定规则支持大小写不敏感的账号 ID 通配符，Key 本身区分大小写。绑定账号不可用时请求失败，不会逃逸到其他账号；未绑定 Key 默认使用额度路由，可用 `unbound: deny` 禁止。绑定 Key 必须通过 Authorization Bearer 或 API-Key 请求头传递；内部指定账号的唤醒不受此限制。
+
+客户端应提供 `Session_id`、`Session-Id`、`X-Codex-Thread-Id`、`X-Session-ID` 或 `X-Conversation-ID`；也支持 CPA 提供的会话元数据。绑定按下游 Key、提供商、模型和会话隔离，状态文件不保存明文 Key 或会话 ID。首次启用时无法读取 CPA 原先的内存绑定，旧会话的首次请求会建立新的插件绑定；应在旧任务结束后切换，或提前迁移已知绑定。状态文件损坏会拒绝启用路由，新绑定写入失败会拒绝该次选号，已有绑定可继续在内存中运行并显示状态错误。额度路由不会保证两个账号的消耗百分比时刻相同，长会话仍会持续消耗其绑定账号。
+
+本功能按 CPA 8.0.33 的调度协议实现，建议使用该版本或更新版本；原有 ABI 1 / schema 6 唤醒接口不变。管理 API 的 `/status` 增加 `quota_routing` 状态，包括缓存额度、活跃绑定数和持久化错误。
+
 ## 项目结构
 
 ```text

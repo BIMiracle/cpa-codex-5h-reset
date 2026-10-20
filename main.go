@@ -45,11 +45,13 @@ import (
 	"unsafe"
 
 	"github.com/BIMiracle/cpa-codex-5h-reset/internal/keeper"
+	"github.com/BIMiracle/cpa-codex-5h-reset/internal/routing"
 )
 
 const pluginID = "cpa-codex-5h-reset"
 
 var engine = keeper.New(host{})
+var accountRouter = routing.New(host{})
 
 type envelope struct {
 	OK     bool            `json:"ok"`

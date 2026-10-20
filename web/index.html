@@ -305,6 +305,8 @@
               默认首次请求 + 3 次重试。已知未来重置时间时等待；否则每隔 30
               秒重试。
             </p>
+            <label><input id="quota-routing" type="checkbox" /> 新会话优先使用五小时剩余额度更多的账号</label>
+            <p class="small">同一会话继续使用已绑定账号；账号不可用时自动切换。默认关闭，保存后生效。如已使用其他账号分配插件，请先按 README 迁移 Key 绑定规则。</p>
             <div class="grid" style="margin-top: 20px">
               <div>
                 <label>每日时点（全部关闭后仍可手动唤醒）</label>

@@ -71,6 +71,44 @@ If the plugin page returns **404**, confirm that the running CPA process has suc
 
 See the [detailed guide (Chinese)](docs/guide.zh-CN.md) for full configuration, retry behavior, management APIs, migration, building, and troubleshooting. In containers, set `state_file` to a writable path on a persistent volume.
 
+## Route new sessions by remaining quota (v0.3.0)
+
+Enable **“新会话优先使用五小时剩余额度更多的账号”** on the plugin page and save. This is opt-in so existing installations keep their current scheduler until configured.
+
+- New Codex sessions choose the lowest five-hour used percentage among available credentials in the highest priority tier. Equal percentages use round-robin.
+- Established sessions retain their credential even when another account later has more headroom. If CPA removes the credential from available candidates, the session fails over and updates its binding.
+- Quota is cached for one minute and refreshed when its window expires. Bindings expire after four hours of inactivity and are persisted for restart recovery. Known, non-exhausted quota is preferred; if all observations are unknown, selection falls back to round-robin.
+- Explicit auth pins, including wake requests, take precedence. Unbound non-Codex routes and requests without stable session identity retain native scheduling. Wake `auth_ids` do not restrict the routing pool.
+
+Add this under `plugins.configs.cpa-codex-5h-reset` to configure it directly:
+
+```yaml
+quota_routing:
+  enabled: true
+  session_ttl: 4h
+  quota_cache_ttl: 1m
+  # state_file: /persistent/path/routing.json  # defaults to wake state_file + ".routing.json"
+```
+
+**Migrate `key-account-bind` before enabling.** CPA activates only its highest-priority scheduler; schedulers are not chained. Copy the old plugin's object-form `bindings` and `unbound` into `quota_routing`, disable the old scheduler, and give this plugin a higher `priority` than competing schedulers:
+
+```yaml
+quota_routing:
+  enabled: true
+  bindings:
+    - key: "downstream-dedicated-key-a"
+      allow: ["codex-account-a.json"]
+    - key: "downstream-dedicated-key-b"
+      allow: ["codex-account-b.json"]
+  unbound: passthrough
+```
+
+Credential globs are case-insensitive; keys remain case-sensitive. A bound key fails closed when no allowed credential is available. Unbound keys use quota routing by default; `unbound: deny` rejects them instead. Bound keys must authenticate using a Bearer/API-Key header; internal pinned wake requests are exempt.
+
+Supported identity headers include `Session_id`, `Session-Id`, `X-Codex-Thread-Id`, `X-Session-ID`, and `X-Conversation-ID`, with CPA session metadata as fallback. Bindings are isolated by downstream key, provider, model, and session. State never contains raw keys or session IDs. On first enable, CPA's previous in-memory bindings cannot be read: finish old tasks before switching, or migrate known bindings beforehand. Invalid state prevents routing activation; failed persistence rejects new bindings while existing bindings can continue in memory and expose a status error. Long sessions can still produce uneven account consumption.
+
+Implemented against CPA 8.0.33's scheduler protocol; use that version or newer. Wake ABI 1 / schema 6 stays unchanged. `/status` includes a `quota_routing` object with cached quotas, active binding count, and persistence errors.
+
 ## Project Structure
 
 ```text

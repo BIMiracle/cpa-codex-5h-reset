@@ -5,13 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"github.com/BIMiracle/cpa-codex-5h-reset/internal/keeper"
+	"github.com/BIMiracle/cpa-codex-5h-reset/internal/routing"
 	"gopkg.in/yaml.v3"
 	"net/http"
 	"strings"
 	"time"
 )
 
-var pluginVersion = "0.2.0"
+var pluginVersion = "0.3.0"
 
 //go:embed web/index.html
 var page []byte
@@ -46,10 +47,33 @@ func handleMethod(method string, raw []byte) ([]byte, error) {
 				return nil, errors.New("invalid plugin configuration")
 			}
 		}
+		if err := c.Validate(); err != nil {
+			return nil, err
+		}
+		routingConfig, err := routing.Parse(req.ConfigYAML, c.StateFile)
+		if err != nil {
+			return nil, err
+		}
+		plan, err := accountRouter.Prepare(routingConfig)
+		if err != nil {
+			return nil, err
+		}
 		if err := engine.Configure(c); err != nil {
 			return nil, err
 		}
-		return okEnvelope(map[string]any{"schema_version": 6, "metadata": map[string]any{"Name": "Codex 五小时重置唤醒", "Version": pluginVersion, "Author": "BIMiracle", "GitHubRepository": "https://github.com/BIMiracle/cpa-codex-5h-reset", "ConfigFields": []map[string]any{{"Name": "model", "Type": "string", "Description": "唤醒模型"}, {"Name": "max_retries", "Type": "number", "Description": "首次请求之外的重试次数，默认 3"}, {"Name": "timezone", "Type": "string", "Description": "IANA 时区"}}}, "capabilities": map[string]any{"management_api": true}})
+		accountRouter.Configure(plan)
+		return okEnvelope(map[string]any{"schema_version": 6, "metadata": map[string]any{"Name": "Codex 五小时重置唤醒", "Version": pluginVersion, "Author": "BIMiracle", "GitHubRepository": "https://github.com/BIMiracle/cpa-codex-5h-reset", "ConfigFields": []map[string]any{{"Name": "model", "Type": "string", "Description": "唤醒模型"}, {"Name": "max_retries", "Type": "number", "Description": "首次请求之外的重试次数，默认 3"}, {"Name": "timezone", "Type": "string", "Description": "IANA 时区"}}}, "capabilities": map[string]any{"management_api": true, "scheduler": routingConfig.Enabled, "scheduler_across_priorities": routingConfig.Enabled}})
+	case "scheduler.pick":
+		var req routing.Request
+		if json.Unmarshal(raw, &req) != nil {
+			return errorEnvelope("invalid_request", "invalid scheduler request", 400), nil
+		}
+		decision := accountRouter.Pick(req)
+		if decision.Reject {
+			// A protocol error also fails closed on hosts predating Reject support.
+			return errorEnvelope(decision.RejectCode, decision.RejectReason, 503), nil
+		}
+		return okEnvelope(decision)
 	case "plugin.quiesce", "plugin.shutdown":
 		engine.Stop()
 		return okEnvelope(map[string]any{})
@@ -77,7 +101,11 @@ func handleManagement(req managementRequest) ([]byte, error) {
 	}
 	switch {
 	case req.Method == "GET" && path == api+"/status":
-		return jsonManagement(200, engine.Status(time.Now()))
+		status := engine.Status(time.Now())
+		return jsonManagement(200, struct {
+			keeper.Status
+			Routing map[string]any `json:"quota_routing"`
+		}{status, accountRouter.Status()})
 	case req.Method == "GET" && path == api+"/logs":
 		return jsonManagement(200, map[string]any{"logs": engine.Logs()})
 	case req.Method == "POST" && path == api+"/run":

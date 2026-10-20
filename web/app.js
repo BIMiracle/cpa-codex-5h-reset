@@ -131,6 +131,8 @@
     }
     if (status.state_error || status.auth_error)
       notice("后台状态：" + (status.state_error || status.auth_error), true);
+    if (status.quota_routing?.state_error)
+      notice("账号分配状态：" + status.quota_routing.state_error, true);
   }
   function scheduleRow(s) {
     const row = document.createElement("div");
@@ -163,6 +165,7 @@
     $("prompt").value = c.prompt;
     $("max-logs").value = c.max_log_entries;
     $("desktop").checked = !!c.desktop_notifications;
+    $("quota-routing").checked = !!c.quota_routing?.enabled;
     $("schedules").replaceChildren();
     (status.config.schedules || []).forEach(scheduleRow);
     $("all-auths").checked = !(c.auth_ids || []).length;
@@ -277,6 +280,7 @@
         prompt: $("prompt").value,
         max_log_entries: Number($("max-logs").value),
         desktop_notifications: $("desktop").checked,
+        quota_routing: { ...(latest.quota_routing || {}), enabled: $("quota-routing").checked },
         auth_ids: $("all-auths").checked ? [] : selected,
         schedules,
       };

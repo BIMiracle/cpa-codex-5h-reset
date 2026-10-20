@@ -136,7 +136,7 @@ http://localhost:8317/v0/resource/plugins/cpa-codex-5h-reset/ui
 2. 安装新动态库，将配置键改为 `cpa-codex-5h-reset`。旧 `times` 数组仍可读取；在新页面保存时转为 `schedules`。
 3. 删除 `retry_attempts`、`retry_initial_seconds`、`retry_max_seconds`、`max_delay_minutes`、`grace_seconds`、`notification_script`；明确设置 `max_retries: 3`。旧的 50 次退避配置不会自动继承。
 4. 新配置的 `state_file` 可先指向旧文件。首次加载会将 schema 1 转为 schema 2，保留已完成和未完成任务，保留已发生的请求次数，新上限为首次请求加三次重试。超过新预算的旧任务结束为失败。
-5. 验证手动唤醒与状态后，再禁用旧的 Windows `CPA Codex Wake A/B` 任务，以免重复唤醒。现有 `key-account-bind` 可继续使用；插件不改变普通请求的轮询与会话粘性。旧专用唤醒 Key 可在切换验证后自行撤销。
+5. 验证手动唤醒与状态后，再禁用旧的 Windows `CPA Codex Wake A/B` 任务，以免重复唤醒。未启用 `quota_routing` 时，现有 `key-account-bind` 可继续使用；启用额度路由时应先将其 `bindings`、`unbound` 迁入本插件，再禁用旧调度器，详见 [README 的额度路由说明](../README.md#按额度分配新会话v030)。旧专用唤醒 Key 可在切换验证后自行撤销。
 
 更新 CPA 时保留稳定的插件目录、状态文件和 `config.yaml`。未来若原生插件 ABI 改变，需要重新构建验证，不能无条件保证兼容。电脑关机、睡眠或 CPA 未运行时无法准点发请求；插件不会代替操作系统启动或唤醒电脑。`scripts/setup-computer-wake.ps1` 仅为旧 Windows 环境的可选辅助脚本，不参与插件重试。
 

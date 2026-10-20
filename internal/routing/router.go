@@ -1,0 +1,483 @@
+// Package routing selects Codex credentials by five-hour headroom while retaining
+// a caller-scoped, model-scoped binding for the lifetime of each active session.
+package routing
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"os"
+	"path"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+	"unicode"
+
+	"github.com/BIMiracle/cpa-codex-5h-reset/internal/keeper"
+)
+
+type Request struct {
+	Provider   string
+	Providers  []string
+	Model      string
+	Options    Options
+	Candidates []Candidate
+}
+
+type Options struct {
+	Headers  map[string][]string
+	Metadata map[string]any
+}
+
+type Candidate struct {
+	ID         string
+	Provider   string
+	Priority   int
+	Status     string
+	Attributes map[string]string
+}
+
+type Response struct {
+	Handled      bool
+	AuthID       string `json:",omitempty"`
+	Reject       bool   `json:",omitempty"`
+	RejectCode   string `json:",omitempty"`
+	RejectReason string `json:",omitempty"`
+}
+
+type Host interface {
+	ListAuths() ([]keeper.Auth, error)
+	FetchQuota(keeper.Auth, time.Time) (keeper.Quota, error)
+	Log(string, string, map[string]any)
+}
+
+type sessionBinding struct {
+	AuthID    string    `json:"auth_id"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+type diskState struct {
+	Schema   int                       `json:"schema"`
+	Bindings map[string]sessionBinding `json:"bindings"`
+}
+
+type Plan struct {
+	config Config
+	loaded map[string]sessionBinding
+}
+
+type Router struct {
+	mu         sync.Mutex
+	refreshMu  sync.Mutex
+	host       Host
+	now        func() time.Time
+	config     Config
+	bindings   map[string]sessionBinding
+	quotas     map[string]keeper.Quota
+	queried    map[string]time.Time
+	last       map[string]string
+	stateError string
+	lastWrite  time.Time
+	loadedFile string
+	generation uint64
+}
+
+func New(h Host) *Router {
+	return &Router{host: h, now: time.Now, bindings: map[string]sessionBinding{}, quotas: map[string]keeper.Quota{}, queried: map[string]time.Time{}, last: map[string]string{}}
+}
+
+// Prepare validates persisted input before the caller changes any live settings.
+func (r *Router) Prepare(c Config) (Plan, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	p := Plan{config: c}
+	if !c.Enabled || r.loadedFile == c.StateFile {
+		return p, nil
+	}
+	raw, err := os.ReadFile(c.StateFile)
+	if errors.Is(err, os.ErrNotExist) {
+		p.loaded = map[string]sessionBinding{}
+		return p, nil
+	}
+	if err != nil {
+		return Plan{}, errors.New("routing_state_read_failed")
+	}
+	var state diskState
+	if json.Unmarshal(raw, &state) != nil || state.Schema != 1 || len(state.Bindings) > 4096 {
+		return Plan{}, errors.New("invalid_routing_state")
+	}
+	for key, binding := range state.Bindings {
+		decoded, err := hex.DecodeString(key)
+		if err != nil || len(decoded) != sha256.Size || binding.AuthID == "" || binding.ExpiresAt.IsZero() {
+			return Plan{}, errors.New("invalid_routing_state")
+		}
+	}
+	p.loaded = state.Bindings
+	return p, nil
+}
+
+func (r *Router) Configure(p Plan) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if p.config.Enabled && r.loadedFile != p.config.StateFile {
+		r.bindings = p.loaded
+		r.loadedFile = p.config.StateFile
+		if r.bindings == nil {
+			r.bindings = map[string]sessionBinding{}
+		}
+	}
+	r.config = p.config
+	r.generation++
+}
+
+func reject(code string) Response {
+	return Response{Handled: true, Reject: true, RejectCode: code, RejectReason: "Codex quota routing: " + code}
+}
+
+func (r *Router) Pick(req Request) Response {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.config.Enabled {
+		return Response{}
+	}
+	// Explicit host pinning (including wake requests) always takes precedence.
+	if pin, _ := req.Options.Metadata["pinned_auth_id"].(string); pin != "" {
+		for _, c := range req.Candidates {
+			if c.ID == pin {
+				return Response{Handled: true, AuthID: pin}
+			}
+		}
+		return reject("pinned_auth_unavailable")
+	}
+	key := downstreamKey(req.Options.Headers)
+	var rule *Binding
+	for i := range r.config.Bindings {
+		if r.config.Bindings[i].Key == key {
+			rule = &r.config.Bindings[i]
+			break
+		}
+	}
+	// A missing header must never bypass explicitly configured key isolation.
+	if (key == "" && len(r.config.Bindings) > 0) || (rule == nil && r.config.Unbound == "deny") {
+		return reject("key_not_bound")
+	}
+	pool := make([]Candidate, 0, len(req.Candidates))
+	allCodex := true
+	for _, c := range req.Candidates {
+		if c.ID == "" || !usable(c.Status) || (rule != nil && !matches(rule.Allow, c.ID)) {
+			continue
+		}
+		pool = append(pool, c)
+		allCodex = allCodex && strings.EqualFold(c.Provider, "codex")
+	}
+	if len(pool) == 0 {
+		if rule != nil {
+			return reject("bound_auth_unavailable")
+		}
+		return Response{}
+	}
+	if !allCodex && rule == nil {
+		return Response{}
+	}
+	identity := sessionID(req.Options)
+	if identity == "" && rule == nil {
+		// No stable identity: retain the host's native affinity/fallback behavior.
+		return Response{}
+	}
+	now := r.now()
+	providerScope := "codex"
+	if !allCodex {
+		providers := map[string]bool{}
+		for _, c := range pool {
+			providers[strings.ToLower(c.Provider)] = true
+		}
+		names := make([]string, 0, len(providers))
+		for provider := range providers {
+			names = append(names, provider)
+		}
+		sort.Strings(names)
+		providerScope = strings.Join(names, ",")
+	}
+	scope := digest(key + "\x00" + providerScope + "\x00" + strings.ToLower(strings.TrimSpace(req.Model)))
+	bindingKey := digest(scope + "\x00" + identity)
+	if identity != "" {
+		if id := r.reuse(bindingKey, pool, now); id != "" {
+			return Response{Handled: true, AuthID: id}
+		}
+	}
+	// Credential priority governs new bindings; an existing binding above outranks it.
+	priority := pool[0].Priority
+	for _, c := range pool {
+		if c.Priority > priority {
+			priority = c.Priority
+		}
+	}
+	eligible := pool[:0]
+	for _, c := range pool {
+		if c.Priority == priority {
+			eligible = append(eligible, c)
+		}
+	}
+	pool = eligible
+	if allCodex {
+		generation := r.generation
+		// Quota transport must not hold up requests for already-bound sessions.
+		r.mu.Unlock()
+		r.refresh(pool, now)
+		r.mu.Lock()
+		if generation != r.generation {
+			// Re-evaluate key isolation and candidates against the new configuration.
+			r.mu.Unlock()
+			decision := r.Pick(req)
+			r.mu.Lock()
+			return decision
+		}
+		if identity != "" {
+			if id := r.reuse(bindingKey, pool, now); id != "" {
+				return Response{Handled: true, AuthID: id}
+			}
+		}
+		known, unknown := []Candidate{}, []Candidate{}
+		best := 101.0
+		for _, c := range pool {
+			q := r.quotas[c.ID]
+			if !q.Known || !now.Before(q.ResetAt) || now.Sub(q.ObservedAt) > r.config.quotaTTL {
+				unknown = append(unknown, c)
+				continue
+			}
+			if q.UsedPercent >= 100 {
+				continue
+			}
+			if q.UsedPercent < best {
+				best, known = q.UsedPercent, nil
+			}
+			if q.UsedPercent == best {
+				known = append(known, c)
+			}
+		}
+		if len(known) > 0 {
+			pool = known
+		} else if len(unknown) > 0 {
+			pool = unknown
+		} else {
+			return reject("five_hour_quota_exhausted")
+		}
+	}
+	sort.Slice(pool, func(i, j int) bool { return pool[i].ID < pool[j].ID })
+	index := sort.Search(len(pool), func(i int) bool { return pool[i].ID > r.last[scope] })
+	if index == len(pool) {
+		index = 0
+	}
+	picked := pool[index].ID
+	if len(r.last) >= 4096 {
+		r.last = map[string]string{}
+	}
+	r.last[scope] = picked
+	if identity != "" {
+		r.prune(now)
+		if _, exists := r.bindings[bindingKey]; !exists && len(r.bindings) >= 4096 {
+			// Do not evict an active session and silently move it on its next turn.
+			return reject("routing_session_capacity")
+		}
+		previous, existed := r.bindings[bindingKey]
+		r.bindings[bindingKey] = sessionBinding{AuthID: picked, ExpiresAt: now.Add(r.config.sessionTTL)}
+		if err := r.save(now); err != nil {
+			if existed {
+				r.bindings[bindingKey] = previous
+			} else {
+				delete(r.bindings, bindingKey)
+			}
+			return reject("routing_state_write_failed")
+		}
+	}
+	r.host.Log("info", "quota_routing_new_binding", map[string]any{"credential": picked, "model": req.Model, "reason": "most_five_hour_remaining"})
+	return Response{Handled: true, AuthID: picked}
+}
+
+func (r *Router) refresh(pool []Candidate, now time.Time) {
+	r.refreshMu.Lock()
+	defer r.refreshMu.Unlock()
+	r.mu.Lock()
+	ttl := r.config.quotaTTL
+	needed := []Candidate{}
+	for _, c := range pool {
+		q, queried := r.quotas[c.ID], r.queried[c.ID]
+		if queried.IsZero() || now.Sub(queried) >= ttl || (q.Known && !now.Before(q.ResetAt)) {
+			needed = append(needed, c)
+		}
+	}
+	r.mu.Unlock()
+	if len(needed) == 0 {
+		return
+	}
+	auths, err := r.host.ListAuths()
+	byID := map[string]keeper.Auth{}
+	if err == nil {
+		for _, a := range auths {
+			if strings.EqualFold(a.Provider, "codex") && !a.Disabled {
+				byID[a.ID] = a
+			}
+		}
+	}
+	fetchedQuotas := map[string]keeper.Quota{}
+	for _, c := range needed {
+		q := keeper.Quota{ObservedAt: now, Error: "quota_unavailable"}
+		if a, ok := byID[c.ID]; ok {
+			if fetched, err := r.host.FetchQuota(a, now); err == nil {
+				q = fetched
+			}
+		}
+		fetchedQuotas[c.ID] = q
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for id, q := range fetchedQuotas {
+		r.quotas[id], r.queried[id] = q, now
+	}
+	if len(r.quotas) > 4096 {
+		for id, queried := range r.queried {
+			if now.Sub(queried) > r.config.quotaTTL {
+				delete(r.quotas, id)
+				delete(r.queried, id)
+			}
+		}
+	}
+}
+
+// reuse is called with mu held, before and after a potentially concurrent refresh.
+func (r *Router) reuse(key string, pool []Candidate, now time.Time) string {
+	if b, ok := r.bindings[key]; ok && now.Before(b.ExpiresAt) {
+		for _, c := range pool {
+			if c.ID == b.AuthID {
+				b.ExpiresAt = now.Add(r.config.sessionTTL)
+				r.bindings[key] = b
+				if now.Sub(r.lastWrite) >= time.Minute {
+					_ = r.save(now)
+				}
+				return b.AuthID
+			}
+		}
+	}
+	return ""
+}
+
+func (r *Router) prune(now time.Time) {
+	for key, b := range r.bindings {
+		if !now.Before(b.ExpiresAt) {
+			delete(r.bindings, key)
+		}
+	}
+}
+
+func (r *Router) save(now time.Time) error {
+	r.prune(now)
+	raw, err := json.Marshal(diskState{Schema: 1, Bindings: r.bindings})
+	if err == nil {
+		err = os.MkdirAll(filepath.Dir(r.config.StateFile), 0700)
+	}
+	if err == nil {
+		var f *os.File
+		f, err = os.CreateTemp(filepath.Dir(r.config.StateFile), ".routing-*.tmp")
+		if err == nil {
+			defer func() { _ = os.Remove(f.Name()) }()
+			if err = f.Chmod(0600); err == nil {
+				_, err = f.Write(raw)
+			}
+			if err == nil {
+				err = f.Sync()
+			}
+			if closeErr := f.Close(); err == nil {
+				err = closeErr
+			}
+			if err == nil {
+				err = os.Rename(f.Name(), r.config.StateFile)
+			}
+		}
+	}
+	if err != nil {
+		r.stateError = "routing_state_write_failed"
+		r.host.Log("warn", r.stateError, map[string]any{})
+		return errors.New(r.stateError)
+	}
+	r.stateError, r.lastWrite = "", now
+	return nil
+}
+
+func (r *Router) Status() map[string]any {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.prune(r.now())
+	quotas := make(map[string]keeper.Quota, len(r.quotas))
+	for id, q := range r.quotas {
+		quotas[id] = q
+	}
+	return map[string]any{"enabled": r.config.Enabled, "session_ttl": r.config.SessionTTL, "quota_cache_ttl": r.config.QuotaCacheTTL, "active_bindings": len(r.bindings), "state_error": r.stateError, "quotas": quotas}
+}
+
+func digest(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
+}
+
+func header(headers map[string][]string, names ...string) string {
+	for _, name := range names {
+		for key, values := range headers {
+			if strings.EqualFold(key, name) {
+				for _, value := range values {
+					if value = strings.TrimSpace(value); value != "" {
+						return value
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func downstreamKey(headers map[string][]string) string {
+	if value := header(headers, "Authorization"); value != "" {
+		parts := strings.Fields(value)
+		if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+			return parts[1]
+		}
+		return ""
+	}
+	return header(headers, "X-API-Key", "Api-Key", "X-Goog-Api-Key")
+}
+
+func sessionID(opts Options) string {
+	id := header(opts.Headers, "X-Codex-Thread-Id", "Session_id", "Session-Id", "X-Session-ID", "X-Conversation-ID")
+	if id == "" {
+		for _, key := range []string{"canonical_session_id", "execution_session_id", "derived_session_id"} {
+			if value, ok := opts.Metadata[key].(string); ok && value != "" {
+				id = value
+				break
+			}
+		}
+	}
+	id = strings.TrimSpace(id)
+	if len(id) > 512 || strings.IndexFunc(id, unicode.IsControl) >= 0 {
+		return ""
+	}
+	return id
+}
+
+func matches(patterns []string, id string) bool {
+	for _, pattern := range patterns {
+		if ok, _ := path.Match(pattern, strings.ToLower(id)); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func usable(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "disabled", "error", "expired", "revoked", "invalid", "unavailable", "cooldown", "quota_exhausted", "blocked":
+		return false
+	}
+	return true
+}
