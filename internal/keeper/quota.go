@@ -10,14 +10,21 @@ import (
 )
 
 type Quota struct {
-	Known       bool      `json:"known"`
-	ResetAt     time.Time `json:"reset_at"`
-	UsedPercent float64   `json:"used_percent"`
-	ObservedAt  time.Time `json:"observed_at"`
-	Error       string    `json:"error,omitempty"`
+	Known       bool         `json:"known"`
+	ResetAt     time.Time    `json:"reset_at"`
+	UsedPercent float64      `json:"used_percent"`
+	ObservedAt  time.Time    `json:"observed_at"`
+	Error       string       `json:"error,omitempty"`
+	Weekly      *QuotaWindow `json:"weekly,omitempty"`
 }
 
-// Match the actual duration, never assume primary means five hours.
+type QuotaWindow struct {
+	ResetAt     time.Time `json:"reset_at"`
+	UsedPercent float64   `json:"used_percent"`
+}
+
+// Match actual durations: some plans expose only a weekly primary window.
+// Known, ResetAt and UsedPercent continue to describe the five-hour window.
 func ParseQuota(raw []byte, now time.Time) (Quota, error) {
 	var doc struct {
 		RateLimit struct {
@@ -25,12 +32,13 @@ func ParseQuota(raw []byte, now time.Time) (Quota, error) {
 			Secondary window `json:"secondary_window"`
 		} `json:"rate_limit"`
 	}
-	unknown := Quota{ObservedAt: now, Error: "quota_unknown"}
+	q := Quota{ObservedAt: now}
 	if json.Unmarshal(raw, &doc) != nil {
-		return unknown, errors.New("invalid quota response")
+		q.Error = "quota_unknown"
+		return q, errors.New("invalid quota response")
 	}
 	for _, w := range []window{doc.RateLimit.Primary, doc.RateLimit.Secondary} {
-		if w.Seconds != 18000 {
+		if w.Seconds != 18000 && w.Seconds != 604800 {
 			continue
 		}
 		reset := w.ResetAt
@@ -40,9 +48,17 @@ func ParseQuota(raw []byte, now time.Time) (Quota, error) {
 		if reset <= 0 || w.Used < 0 || w.Used > 100 {
 			continue
 		}
-		return Quota{Known: true, ResetAt: time.Unix(reset, 0), UsedPercent: w.Used, ObservedAt: now}, nil
+		if w.Seconds == 18000 {
+			q.Known, q.ResetAt, q.UsedPercent = true, time.Unix(reset, 0), w.Used
+		} else {
+			q.Weekly = &QuotaWindow{ResetAt: time.Unix(reset, 0), UsedPercent: w.Used}
+		}
 	}
-	return unknown, errors.New("five hour window unavailable")
+	if q.Known || q.Weekly != nil {
+		return q, nil
+	}
+	q.Error = "quota_unknown"
+	return q, errors.New("quota windows unavailable")
 }
 
 type window struct {

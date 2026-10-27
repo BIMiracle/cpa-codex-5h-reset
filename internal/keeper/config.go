@@ -14,19 +14,44 @@ type Schedule struct {
 	At      string `yaml:"at" json:"at"`
 	Enabled bool   `yaml:"enabled" json:"enabled"`
 }
+
+type OneTimeRule struct {
+	Mode      string `yaml:"mode" json:"mode"`
+	StartDate string `yaml:"start_date,omitempty" json:"start_date,omitempty"`
+	EndDate   string `yaml:"end_date,omitempty" json:"end_date,omitempty"`
+}
+
+func (r OneTimeRule) Effective(now time.Time, timezone string) OneTimeRule {
+	loc, err := time.LoadLocation(timezone)
+	if err != nil || r.Mode == "" || r.Mode == "none" || r.EndDate < now.In(loc).Format("2006-01-02") {
+		return OneTimeRule{Mode: "none"}
+	}
+	return r
+}
+
+func parseDate(value string) (time.Time, error) {
+	t, err := time.Parse("2006-01-02", value)
+	if err != nil || t.Format("2006-01-02") != value {
+		return time.Time{}, fmt.Errorf("date must be YYYY-MM-DD")
+	}
+	return t, nil
+}
+
 type Config struct {
-	Enabled              bool       `yaml:"enabled" json:"enabled"`
-	Model                string     `yaml:"model" json:"model"`
-	ReasoningEffort      string     `yaml:"reasoning_effort" json:"reasoning_effort"`
-	Prompt               string     `yaml:"prompt" json:"prompt"`
-	Timezone             string     `yaml:"timezone" json:"timezone"`
-	Schedules            []Schedule `yaml:"schedules" json:"schedules"`
-	AuthIDs              []string   `yaml:"auth_ids" json:"auth_ids"`
-	StateFile            string     `yaml:"state_file" json:"state_file"`
-	MaxRetries           int        `yaml:"max_retries" json:"max_retries"`
-	DesktopNotifications bool       `yaml:"desktop_notifications" json:"desktop_notifications"`
-	MaxLogEntries        int        `yaml:"max_log_entries" json:"max_log_entries"`
-	Times                []string   `yaml:"times,omitempty" json:"times,omitempty"`
+	Enabled              bool        `yaml:"enabled" json:"enabled"`
+	Model                string      `yaml:"model" json:"model"`
+	ReasoningEffort      string      `yaml:"reasoning_effort" json:"reasoning_effort"`
+	Prompt               string      `yaml:"prompt" json:"prompt"`
+	Timezone             string      `yaml:"timezone" json:"timezone"`
+	SkipCNHolidays       bool        `yaml:"skip_cn_holidays" json:"skip_cn_holidays"`
+	OneTimeRule          OneTimeRule `yaml:"one_time_rule" json:"one_time_rule"`
+	Schedules            []Schedule  `yaml:"schedules" json:"schedules"`
+	AuthIDs              []string    `yaml:"auth_ids" json:"auth_ids"`
+	StateFile            string      `yaml:"state_file" json:"state_file"`
+	MaxRetries           int         `yaml:"max_retries" json:"max_retries"`
+	DesktopNotifications bool        `yaml:"desktop_notifications" json:"desktop_notifications"`
+	MaxLogEntries        int         `yaml:"max_log_entries" json:"max_log_entries"`
+	Times                []string    `yaml:"times,omitempty" json:"times,omitempty"`
 }
 
 func Defaults() Config {
@@ -34,7 +59,7 @@ func Defaults() Config {
 	if err != nil {
 		root = "plugins"
 	}
-	return Config{Model: "gpt-6-luna", ReasoningEffort: "low", Prompt: "Reply with OK.", Timezone: "Asia/Singapore", MaxRetries: 3, MaxLogEntries: 200,
+	return Config{Model: "gpt-6-luna", ReasoningEffort: "low", Prompt: "Reply with OK.", Timezone: "Asia/Singapore", OneTimeRule: OneTimeRule{Mode: "none"}, MaxRetries: 3, MaxLogEntries: 200,
 		StateFile: filepath.Join(root, "CLIProxyAPI", "state", "cpa-codex-5h-reset.json"),
 		Schedules: []Schedule{{"morning", "05:00", true}, {"midday", "10:01", true}, {"afternoon", "15:02", true}, {"evening", "20:03", true}}}
 }
@@ -51,6 +76,25 @@ func (c *Config) Validate() error {
 	}
 	if _, err := time.LoadLocation(c.Timezone); err != nil {
 		return fmt.Errorf("invalid timezone")
+	}
+	r := &c.OneTimeRule
+	switch r.Mode {
+	case "", "none":
+		*r = OneTimeRule{Mode: "none"}
+	case "exclude", "wake_tomorrow":
+		start, err := parseDate(r.StartDate)
+		if err != nil {
+			return fmt.Errorf("invalid one_time_rule start_date")
+		}
+		end, err := parseDate(r.EndDate)
+		if err != nil || end.Before(start) || end.Sub(start) > 29*24*time.Hour {
+			return fmt.Errorf("one_time_rule must cover 1..30 calendar days")
+		}
+		if r.Mode == "wake_tomorrow" && r.StartDate != r.EndDate {
+			return fmt.Errorf("wake_tomorrow must specify one fixed date")
+		}
+	default:
+		return fmt.Errorf("invalid one_time_rule mode")
 	}
 	if c.Times != nil {
 		c.Schedules = nil
@@ -118,23 +162,29 @@ type ScheduledTime struct {
 	Time time.Time `json:"time"`
 }
 
-func NextRuns(c Config, now time.Time) []ScheduledTime {
+func NextRuns(c Config, now time.Time, calendars ...*Holidays) []ScheduledTime {
 	loc, _ := time.LoadLocation(c.Timezone)
 	out := []ScheduledTime{}
 	if loc == nil {
 		return out
 	}
 	local := now.In(loc)
+	var holidays *Holidays
+	if len(calendars) > 0 {
+		holidays = calendars[0]
+	}
 	for _, s := range c.Schedules {
 		if !s.Enabled {
 			continue
 		}
 		t, _ := time.Parse("15:04", s.At)
-		due := time.Date(local.Year(), local.Month(), local.Day(), t.Hour(), t.Minute(), 0, 0, loc)
-		if !due.After(now) {
-			due = due.AddDate(0, 0, 1)
+		for day := 0; day < 366; day++ {
+			due := time.Date(local.Year(), local.Month(), local.Day()+day, t.Hour(), t.Minute(), 0, 0, loc)
+			if due.After(now) && DateBlockReason(c, due, holidays) == "" {
+				out = append(out, ScheduledTime{s.ID, s.At, due})
+				break
+			}
 		}
-		out = append(out, ScheduledTime{s.ID, s.At, due})
 	}
 	return out
 }

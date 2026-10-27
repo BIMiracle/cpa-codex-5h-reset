@@ -15,21 +15,32 @@ import (
 )
 
 type fakeHost struct {
-	used  map[string]float64
-	fail  bool
-	calls int
-	now   time.Time
+	used       map[string]float64
+	weeklyUsed map[string]float64
+	weeklyOnly map[string]bool
+	fail       bool
+	failIDs    map[string]bool
+	auths      []keeper.Auth
+	calls      int
+	now        time.Time
 }
 
 func (h *fakeHost) ListAuths() ([]keeper.Auth, error) {
+	if h.auths != nil {
+		return h.auths, nil
+	}
 	return []keeper.Auth{{ID: "a.json", AuthIndex: "a", Provider: "codex"}, {ID: "b.json", AuthIndex: "b", Provider: "codex"}}, nil
 }
 func (h *fakeHost) FetchQuota(a keeper.Auth, now time.Time) (keeper.Quota, error) {
 	h.calls++
-	if h.fail {
+	if h.fail || h.failIDs[a.ID] {
 		return keeper.Quota{}, errors.New("never expose secret-token")
 	}
-	return keeper.Quota{Known: true, UsedPercent: h.used[a.ID], ResetAt: h.now.Add(5 * time.Hour), ObservedAt: now}, nil
+	q := keeper.Quota{Known: !h.weeklyOnly[a.ID], UsedPercent: h.used[a.ID], ResetAt: h.now.Add(5 * time.Hour), ObservedAt: now}
+	if used, ok := h.weeklyUsed[a.ID]; ok {
+		q.Weekly = &keeper.QuotaWindow{UsedPercent: used, ResetAt: h.now.Add(7 * 24 * time.Hour)}
+	}
+	return q, nil
 }
 func (*fakeHost) Log(string, string, map[string]any) {}
 
@@ -54,7 +65,7 @@ func request(session string) Request {
 }
 
 func fixture() *fakeHost {
-	return &fakeHost{now: time.Date(2026, 10, 20, 10, 0, 0, 0, time.UTC), used: map[string]float64{"a.json": 76, "b.json": 21}}
+	return &fakeHost{now: time.Date(2026, 10, 20, 10, 0, 0, 0, time.UTC), used: map[string]float64{"a.json": 21, "b.json": 21}}
 }
 
 func picked(t *testing.T, r *Router, req Request, want string) {
@@ -64,37 +75,278 @@ func picked(t *testing.T, r *Router, req Request, want string) {
 	}
 }
 
-func TestNewSessionHeadroomAndExistingSessionAffinity(t *testing.T) {
+func TestNewSessionBalanceAndExistingSessionAffinity(t *testing.T) {
 	h := fixture()
 	r := configured(t, h, "")
-	picked(t, r, request("old-session"), "b.json")
-	h.used = map[string]float64{"a.json": 10, "b.json": 80}
+	picked(t, r, request("old-session"), "a.json")
+	h.used = map[string]float64{"a.json": 22, "b.json": 20}
 	h.now = h.now.Add(2 * time.Minute)
-	picked(t, r, request("old-session"), "b.json")
-	if h.calls != 2 {
-		t.Fatal("sticky request queried upstream quota", h.calls)
+	picked(t, r, request("old-session"), "a.json")
+	if h.calls != 4 {
+		t.Fatal("active session did not refresh expired quota", h.calls)
 	}
-	picked(t, r, request("new-session"), "a.json")
-	picked(t, r, request("old-session"), "b.json")
+	picked(t, r, request("new-session"), "b.json")
+	picked(t, r, request("old-session"), "a.json")
 	if h.calls != 4 {
 		t.Fatal("quota cache not reused", h.calls)
 	}
 	// Host retries remove the failed/limited auth from Candidates.
 	retry := request("old-session")
-	retry.Candidates = retry.Candidates[:1]
-	picked(t, r, retry, "a.json")
-	picked(t, r, request("old-session"), "a.json")
+	retry.Candidates = retry.Candidates[1:]
+	picked(t, r, retry, "b.json")
+	picked(t, r, request("old-session"), "b.json")
+}
+
+func mixedPlanPool() (*fakeHost, []Candidate) {
+	h := fixture()
+	h.auths = []keeper.Auth{
+		{ID: "a-business.json", AuthIndex: "a", Provider: "codex", PlanType: "self_serve_business_prolite"},
+		{ID: "b-plus.json", AuthIndex: "b", Provider: "codex", PlanType: "plus"},
+		{ID: "c-plus.json", AuthIndex: "c", Provider: "codex", PlanType: "plus"},
+	}
+	h.used = map[string]float64{"a-business.json": 1, "b-plus.json": 3, "c-plus.json": 5}
+	candidates := []Candidate{}
+	for _, a := range h.auths {
+		candidates = append(candidates, Candidate{ID: a.ID, Provider: a.Provider})
+	}
+	return h, candidates
+}
+
+func TestBusinessAndPlusAccountsRotateWhenQuotasAreClose(t *testing.T) {
+	h, candidates := mixedPlanPool()
+	r := configured(t, h, "")
+	counts := map[string]int{}
+	for i := range 18 {
+		req := request(fmt.Sprintf("balanced-%d", i))
+		req.Candidates = candidates
+		got := r.Pick(req)
+		if !got.Handled || got.Reject || got.AuthID == "" {
+			t.Fatalf("new session rejected: %+v", got)
+		}
+		counts[got.AuthID]++
+		// Repeated turns keep affinity without consuming another rotation slot.
+		picked(t, r, req, got.AuthID)
+	}
+	for _, c := range candidates {
+		if counts[c.ID] != 6 {
+			t.Fatalf("nearby quota observations did not rotate equally: %v", counts)
+		}
+	}
+	if h.calls != 3 {
+		t.Fatalf("quota cache was bypassed: %d", h.calls)
+	}
+}
+
+func TestWeeklyHeadroomFavorsPlusAndRebalancesBusinessSession(t *testing.T) {
+	h, candidates := mixedPlanPool()
+	// Match the reported remaining percentages: weekly 68/98/96 and
+	// five-hour 94/76 for Plus; Business exposes no five-hour window.
+	h.weeklyOnly = map[string]bool{"a-business.json": true}
+	h.weeklyUsed = map[string]float64{"a-business.json": 32, "b-plus.json": 2, "c-plus.json": 4}
+	h.used = map[string]float64{"b-plus.json": 6, "c-plus.json": 24}
+	r := configured(t, h, "")
+	old := request("old-business-session")
+	old.Candidates = candidates[:1]
+	picked(t, r, old, "a-business.json")
+	old.Candidates = candidates
+	picked(t, r, old, "b-plus.json")
+	for i := range 3 {
+		req := request(fmt.Sprintf("headroom-%d", i))
+		req.Candidates = candidates
+		picked(t, r, req, "b-plus.json")
+	}
+	picked(t, r, old, "b-plus.json")
+	if h.calls != 3 {
+		t.Fatalf("quota cache was not shared across old and new sessions: %d", h.calls)
+	}
+}
+
+func TestWeeklyUsageWinsOverFiveHourUsage(t *testing.T) {
+	h := fixture()
+	h.used = map[string]float64{"a.json": 1, "b.json": 80}
+	h.weeklyUsed = map[string]float64{"a.json": 32, "b.json": 2}
+	r := configured(t, h, "")
+	picked(t, r, request("week-first"), "b.json")
+}
+
+func TestActiveSessionRefreshesAndRebalancesWithoutNewSessions(t *testing.T) {
+	h := fixture()
+	h.weeklyUsed = map[string]float64{"a.json": 0, "b.json": 2}
+	r := configured(t, h, "")
+	picked(t, r, request("long-running"), "a.json")
+	h.weeklyUsed["a.json"] = 9
+	h.now = h.now.Add(time.Minute)
+	picked(t, r, request("long-running"), "a.json")
+	h.weeklyUsed["a.json"] = 32
+	h.now = h.now.Add(time.Minute)
+	picked(t, r, request("long-running"), "b.json")
+	if h.calls != 6 {
+		t.Fatalf("long session did not keep quota fresh: %d", h.calls)
+	}
+}
+
+func TestFiveHourHeadroomAndRebindTolerance(t *testing.T) {
+	h := fixture()
+	h.weeklyUsed = map[string]float64{"a.json": 2, "b.json": 4}
+	h.used = map[string]float64{"a.json": 10, "b.json": 12}
+	r := configured(t, h, "")
+	picked(t, r, request("active"), "a.json")
+	h.used["a.json"], h.used["b.json"] = 30, 12
+	h.now = h.now.Add(time.Minute)
+	picked(t, r, request("active"), "a.json")
+	picked(t, r, request("new"), "b.json")
+	h.used["a.json"] = 40
+	h.now = h.now.Add(time.Minute)
+	picked(t, r, request("active"), "b.json")
+}
+
+func TestWeeklyOnlyExhaustionAndReset(t *testing.T) {
+	h := fixture()
+	h.weeklyOnly = map[string]bool{"a.json": true}
+	h.weeklyUsed = map[string]float64{"a.json": 100, "b.json": 20}
+	r := configured(t, h, "")
+	picked(t, r, request("before-reset"), "b.json")
+	q := r.quotas["a.json"]
+	q.Weekly.ResetAt = h.now.Add(time.Second)
+	r.quotas["a.json"] = q
+	h.weeklyUsed["a.json"] = 0
+	h.now = h.now.Add(2 * time.Second)
+	picked(t, r, request("after-reset"), "a.json")
+	if h.calls != 3 {
+		t.Fatalf("weekly reset did not invalidate just the expired window: %d", h.calls)
+	}
+	h.weeklyUsed["a.json"], h.weeklyUsed["b.json"] = 100, 100
+	h.now = h.now.Add(time.Minute)
+	if got := r.Pick(request("both-exhausted")); !got.Reject || got.RejectCode != "quota_exhausted" {
+		t.Fatalf("exhausted weekly pool accepted: %+v", got)
+	}
+}
+
+func TestMissingFiveHourQuotaIsNotTreatedAsZeroUsage(t *testing.T) {
+	h, candidates := mixedPlanPool()
+	h.weeklyOnly = map[string]bool{"a-business.json": true}
+	h.weeklyUsed = map[string]float64{"a-business.json": 4, "b-plus.json": 4, "c-plus.json": 4}
+	h.used = map[string]float64{"b-plus.json": 30, "c-plus.json": 32}
+	r := configured(t, h, "")
+	for i := range 6 {
+		req := request(fmt.Sprintf("missing-window-%d", i))
+		req.Candidates = candidates
+		picked(t, r, req, candidates[i%len(candidates)].ID)
+	}
+}
+
+func TestUnknownPlusQuotaStillSharesRotation(t *testing.T) {
+	h, candidates := mixedPlanPool()
+	h.failIDs = map[string]bool{"b-plus.json": true, "c-plus.json": true}
+	r := configured(t, h, "")
+	for i := range 6 {
+		req := request(fmt.Sprintf("unknown-%d", i))
+		req.Candidates = candidates
+		picked(t, r, req, candidates[i%len(candidates)].ID)
+	}
+	if h.calls != 3 {
+		t.Fatalf("unknown quota was repeatedly queried: %d", h.calls)
+	}
+}
+
+func TestExhaustedAccountsAreSkippedAndRejoinAfterReset(t *testing.T) {
+	h, candidates := mixedPlanPool()
+	h.used["b-plus.json"] = 100
+	r := configured(t, h, "")
+	for i, want := range []string{"a-business.json", "c-plus.json", "a-business.json", "c-plus.json"} {
+		req := request(fmt.Sprintf("exhausted-%d", i))
+		req.Candidates = candidates
+		picked(t, r, req, want)
+	}
+	q := r.quotas["b-plus.json"]
+	q.ResetAt = h.now.Add(time.Second)
+	r.quotas["b-plus.json"] = q
+	h.now = h.now.Add(2 * time.Second)
+	h.used["b-plus.json"] = 0
+	for i, want := range []string{"a-business.json", "b-plus.json", "c-plus.json"} {
+		req := request(fmt.Sprintf("reset-%d", i))
+		req.Candidates = candidates
+		picked(t, r, req, want)
+	}
+	if h.calls != 4 {
+		t.Fatalf("reset did not refresh exactly the expired account: %d", h.calls)
+	}
+}
+
+func TestExhaustedPriorityTierFallsBackAndBoundSessionMoves(t *testing.T) {
+	h := fixture()
+	r := configured(t, h, "")
+	req := request("sticky")
+	req.Candidates[0].Priority = 10
+	picked(t, r, req, "a.json")
+	h.used["a.json"] = 100
+	h.now = h.now.Add(time.Minute)
+	other := req
+	other.Options = request("new").Options
+	picked(t, r, other, "b.json")
+	// Fresh exhaustion also invalidates the old binding while the host still
+	// includes that auth in its candidate list.
+	picked(t, r, req, "b.json")
+	h.used["a.json"] = 0
+	h.now = h.now.Add(time.Minute)
+	other.Options = request("recovered").Options
+	picked(t, r, other, "a.json")
+	picked(t, r, req, "b.json")
+}
+
+func TestRoundRobinCursorSurvivesRestart(t *testing.T) {
+	h, candidates := mixedPlanPool()
+	r := configured(t, h, "")
+	for i := range 6 {
+		req := request(fmt.Sprintf("restart-%d", i))
+		req.Candidates = candidates
+		picked(t, r, req, candidates[i%len(candidates)].ID)
+		restarted := New(h)
+		restarted.now = r.now
+		plan, err := restarted.Prepare(r.config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		restarted.Configure(plan)
+		r = restarted
+	}
+}
+
+func TestLegacyBindingsLoadWithoutRotationCursor(t *testing.T) {
+	h := fixture()
+	r := configured(t, h, "")
+	scope := digest("client-key\x00codex\x00gpt-6.1-sol")
+	key := digest(scope + "\x00legacy-session")
+	raw, err := json.Marshal(diskState{Schema: 1, Bindings: map[string]sessionBinding{
+		key: {AuthID: "b.json", ExpiresAt: h.now.Add(time.Hour)},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(r.config.StateFile, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	restarted := New(h)
+	restarted.now = r.now
+	plan, err := restarted.Prepare(r.config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted.Configure(plan)
+	picked(t, restarted, request("legacy-session"), "b.json")
+	picked(t, restarted, request("new-session"), "a.json")
+	picked(t, restarted, request("another-session"), "b.json")
 }
 
 func TestBindingsSurviveRestartReconfigureAndDisable(t *testing.T) {
 	h := fixture()
 	r := configured(t, h, "")
-	picked(t, r, request("private-session"), "b.json")
+	picked(t, r, request("private-session"), "a.json")
 	raw, err := os.ReadFile(r.config.StateFile)
 	if err != nil || strings.Contains(string(raw), "client-key") || strings.Contains(string(raw), "private-session") {
 		t.Fatalf("state leaks caller identity: %s %v", raw, err)
 	}
-	h.used = map[string]float64{"a.json": 1, "b.json": 99}
+	h.used = map[string]float64{"a.json": 23, "b.json": 21}
 	restarted := New(h)
 	restarted.now = r.now
 	// Loading a disabled plugin first must not suppress a later state restore.
@@ -110,12 +362,12 @@ func TestBindingsSurviveRestartReconfigureAndDisable(t *testing.T) {
 		t.Fatal(err)
 	}
 	restarted.Configure(plan)
-	picked(t, restarted, request("private-session"), "b.json")
+	picked(t, restarted, request("private-session"), "a.json")
 	plan, _ = restarted.Prepare(r.config)
 	restarted.Configure(plan)
-	picked(t, restarted, request("private-session"), "b.json")
-	h.now = h.now.Add(4*time.Hour + time.Second)
 	picked(t, restarted, request("private-session"), "a.json")
+	h.now = h.now.Add(4*time.Hour + time.Second)
+	picked(t, restarted, request("private-session"), "b.json")
 }
 
 func TestUnknownQuotaTieFallbackAndResetInvalidation(t *testing.T) {
@@ -163,7 +415,7 @@ func TestKeyIsolationPinningProviderAndPriority(t *testing.T) {
 	}
 	otherKey := request("session")
 	otherKey.Options.Headers["Authorization"] = []string{"Bearer other-key"}
-	picked(t, r, otherKey, "b.json")
+	picked(t, r, otherKey, "a.json")
 	denied := configured(t, h, "  unbound: deny\n")
 	if got := denied.Pick(request("x")); !got.Reject {
 		t.Fatal("unbound=deny bypassed")
@@ -189,17 +441,25 @@ func TestCallerAndModelNamespacesAndMissingIdentity(t *testing.T) {
 	r := configured(t, h, "")
 	picked(t, r, request("same-id"), "a.json")
 	h.now = h.now.Add(time.Minute)
-	h.used["a.json"], h.used["b.json"] = 90, 1
+	h.used["a.json"], h.used["b.json"] = 22, 21
 	other := request("same-id")
 	other.Options.Headers["Authorization"] = []string{"Bearer Client-Key"}
+	other.Options.Headers["session_id"] = []string{"primer"}
+	picked(t, r, other, "a.json")
+	other.Options.Headers["session_id"] = []string{"same-id"}
 	picked(t, r, other, "b.json")
 	other = request("same-id")
 	other.Model = "gpt-6-luna"
+	other.Options.Headers["session_id"] = []string{"primer"}
+	picked(t, r, other, "a.json")
+	other.Options.Headers["session_id"] = []string{"same-id"}
 	picked(t, r, other, "b.json")
 	picked(t, r, request("same-id"), "a.json")
 	missing := request("")
-	if got := r.Pick(missing); got.Handled {
-		t.Fatal("request without stable identity was intercepted")
+	picked(t, r, missing, "b.json")
+	picked(t, r, missing, "a.json")
+	if len(r.bindings) != 5 {
+		t.Fatal("request without stable identity created a binding")
 	}
 	missing.Options.Metadata = map[string]any{"execution_session_id": "execution-identity"}
 	picked(t, r, missing, "b.json")
@@ -209,7 +469,7 @@ func TestExhaustedQuotaAndBrokenStateFailClosed(t *testing.T) {
 	h := fixture()
 	h.used = map[string]float64{"a.json": 100, "b.json": 100}
 	r := configured(t, h, "")
-	if got := r.Pick(request("empty")); !got.Reject || got.RejectCode != "five_hour_quota_exhausted" {
+	if got := r.Pick(request("empty")); !got.Reject || got.RejectCode != "quota_exhausted" {
 		t.Fatalf("exhausted pool accepted: %+v", got)
 	}
 	h = fixture()
@@ -238,16 +498,26 @@ func TestConcurrentSessionsAndBoundedCapacity(t *testing.T) {
 	h := fixture()
 	r := configured(t, h, "")
 	var wg sync.WaitGroup
+	results := make(chan Response, 20)
 	for i := range 20 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if got := r.Pick(request(fmt.Sprint(i))); got.AuthID != "b.json" || got.Reject {
-				t.Errorf("concurrent pick: %+v", got)
-			}
+			results <- r.Pick(request(fmt.Sprint(i)))
 		}()
 	}
 	wg.Wait()
+	close(results)
+	counts := map[string]int{}
+	for got := range results {
+		if !got.Handled || got.Reject {
+			t.Fatalf("concurrent pick: %+v", got)
+		}
+		counts[got.AuthID]++
+	}
+	if counts["a.json"] != 10 || counts["b.json"] != 10 {
+		t.Fatalf("concurrent sessions were not balanced: %v", counts)
+	}
 	if h.calls != 2 || len(r.bindings) != 20 {
 		t.Fatalf("parallel lookup duplication/binding loss: %d %d", h.calls, len(r.bindings))
 	}
@@ -257,10 +527,17 @@ func TestConcurrentSessionsAndBoundedCapacity(t *testing.T) {
 	if got := r.Pick(request("capacity-new")); !got.Reject || got.RejectCode != "routing_session_capacity" {
 		t.Fatal("capacity silently evicted active bindings", got)
 	}
-	picked(t, r, request("0"), "b.json")
+	existing := r.Pick(request("0"))
+	if !existing.Handled || existing.Reject || existing.AuthID == "" {
+		t.Fatal("existing binding rejected at capacity", existing)
+	}
 	retry := request("0")
-	retry.Candidates = retry.Candidates[:1]
-	picked(t, r, retry, "a.json")
+	if existing.AuthID == "a.json" {
+		retry.Candidates = retry.Candidates[1:]
+	} else {
+		retry.Candidates = retry.Candidates[:1]
+	}
+	picked(t, r, retry, retry.Candidates[0].ID)
 }
 
 func TestConfigurationValidation(t *testing.T) {
@@ -299,7 +576,7 @@ func (h *blockingHost) FetchQuota(a keeper.Auth, now time.Time) (keeper.Quota, e
 func TestSlowQuotaLookupDoesNotBlockExistingSession(t *testing.T) {
 	h := fixture()
 	r := configured(t, h, "")
-	picked(t, r, request("existing"), "b.json")
+	picked(t, r, request("existing"), "a.json")
 	h.now = h.now.Add(2 * time.Minute)
 	blocked := &blockingHost{fakeHost: h, started: make(chan struct{}), release: make(chan struct{})}
 	r.host = blocked
@@ -310,7 +587,7 @@ func TestSlowQuotaLookupDoesNotBlockExistingSession(t *testing.T) {
 	go func() { sticky <- r.Pick(request("existing")) }()
 	select {
 	case got := <-sticky:
-		if got.AuthID != "b.json" {
+		if got.AuthID != "a.json" {
 			t.Error(got)
 		}
 	case <-time.After(time.Second):

@@ -59,7 +59,7 @@ func (h *fakeHost) now() time.Time                     { h.mu.Lock(); defer h.mu
 func (h *fakeHost) advance(t time.Time)                { h.mu.Lock(); h.clock = t; h.mu.Unlock() }
 func fixture(t *testing.T) (*Engine, *fakeHost, Config) {
 	t.Helper()
-	h := &fakeHost{auths: []Auth{{ID: "a", Provider: "codex"}, {ID: "b", Provider: "codex"}}, codes: map[string][]int{}, quotas: map[string][]Quota{}, calls: map[string]int{}, clock: time.Date(2026, 9, 29, 7, 2, 0, 0, time.UTC)}
+	h := &fakeHost{auths: []Auth{{ID: "a", Provider: "codex", PlanType: "plus"}, {ID: "b", Provider: "codex", PlanType: "plus"}}, codes: map[string][]int{}, quotas: map[string][]Quota{}, calls: map[string]int{}, clock: time.Date(2026, 9, 29, 7, 2, 0, 0, time.UTC)}
 	e := New(h)
 	e.now = h.now
 	c := Defaults()
@@ -251,11 +251,12 @@ func TestSuccessOldWindow(t *testing.T) {
 func TestQuotaParsing(t *testing.T) {
 	now := time.Now()
 	for _, tc := range []struct {
-		body  string
-		known bool
-	}{{`{"rate_limit":{"primary_window":{"limit_window_seconds":604800,"reset_at":1800000000}}}`, false}, {`{"rate_limit":{"primary_window":{"limit_window_seconds":604800,"reset_at":1800000000},"secondary_window":{"limit_window_seconds":18000,"reset_at":1790665500,"used_percent":25}}}`, true}, {`{"rate_limit":{"primary_window":{"limit_window_seconds":18000,"reset_after_seconds":30}}}`, true}, {`{"rate_limit":{"primary_window":{"reset_at":1800000000}}}`, false}, {`bad`, false}} {
+		body      string
+		known     bool
+		available bool
+	}{{`{"rate_limit":{"primary_window":{"limit_window_seconds":604800,"reset_at":1800000000}}}`, false, true}, {`{"rate_limit":{"primary_window":{"limit_window_seconds":604800,"reset_at":1800000000},"secondary_window":{"limit_window_seconds":18000,"reset_at":1790665500,"used_percent":25}}}`, true, true}, {`{"rate_limit":{"primary_window":{"limit_window_seconds":18000,"reset_after_seconds":30}}}`, true, true}, {`{"rate_limit":{"primary_window":{"reset_at":1800000000}}}`, false, false}, {`bad`, false, false}} {
 		q, err := ParseQuota([]byte(tc.body), now)
-		if q.Known != tc.known || (err == nil) != tc.known {
+		if q.Known != tc.known || (err == nil) != tc.available {
 			t.Fatalf("%s: %+v %v", tc.body, q, err)
 		}
 	}

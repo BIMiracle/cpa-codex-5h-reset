@@ -27,7 +27,8 @@ class Plugin(C.Structure):
 
 
 held, errors = {}, []
-used = {"a": 76, "b": 21}
+used = {"a": None, "b": 30, "c": 32}
+weekly = {"a": 4, "b": 4, "c": 4}
 queries = 0
 
 
@@ -37,14 +38,19 @@ def host_call(ctx, method, data, length, output):
     try:
         method, req = method.decode(), json.loads(C.string_at(data, length))
         if method == "host.auth.list":
-            result = {"files": [{"id": k, "auth_index": k, "provider": "codex"} for k in used]}
+            result = {"files": [{"id": k, "auth_index": k, "provider": "codex",
+                       "plan_type": "self_serve_business_prolite" if k == "a" else "plus"} for k in used]}
         elif method == "host.auth.get":
             result = {"json": {"access_token": "fake-secret-" + req["auth_index"]}}
         elif method == "host.http.do":
             assert req["URL"] == "https://chatgpt.com/backend-api/wham/usage"
             key = req["Headers"]["Authorization"][0].rsplit("-", 1)[-1]
-            body = {"rate_limit": {"primary_window": {"limit_window_seconds": 18000,
-                    "used_percent": used[key], "reset_at": int(time.time()) + 18000}}}
+            windows = {"primary_window": {"limit_window_seconds": 604800,
+                       "used_percent": weekly[key], "reset_at": int(time.time()) + 604800}}
+            if used[key] is not None:
+                windows["secondary_window"] = {"limit_window_seconds": 18000,
+                    "used_percent": used[key], "reset_at": int(time.time()) + 18000}
+            body = {"rate_limit": windows}
             result = {"StatusCode": 200, "Body": base64.b64encode(json.dumps(body).encode()).decode()}
             queries += 1
         elif method == "host.log":
@@ -85,7 +91,7 @@ def invoke(method, payload):
     return result
 
 
-def pick(session, key="general", candidates=("a", "b"), metadata=None):
+def pick(session, key="general", candidates=("a", "b", "c"), metadata=None):
     return invoke("scheduler.pick", {"Providers": ["codex"], "Model": "gpt-6.1-sol",
         "Options": {"Headers": {"Authorization": ["Bearer " + key], "Session_id": [session]},
                     "Metadata": metadata or {}},
@@ -99,13 +105,22 @@ with tempfile.TemporaryDirectory() as tmp:
     payload = {"config_yaml": base64.b64encode(json.dumps(config).encode()).decode()}
     caps = invoke("plugin.register", payload)["result"]["capabilities"]
     assert caps["scheduler"] and caps["scheduler_across_priorities"]
-    assert pick("first")["result"]["AuthID"] == "b"
-    used.update(a=0, b=90)
-    assert pick("first")["result"]["AuthID"] == "b"
-    assert queries == 2, "sticky session refreshed quota"
+    assert pick("first")["result"]["AuthID"] == "a"
+    assert pick("second")["result"]["AuthID"] == "b"
+    assert pick("third")["result"]["AuthID"] == "c"
+    weekly.update(a=32, b=2, c=4)
+    used.update(b=6, c=24)
+    assert pick("first")["result"]["AuthID"] == "a"
+    assert queries == 3, "sticky session refreshed quota"
     time.sleep(1.05)
-    assert pick("second")["result"]["AuthID"] == "a"
+    assert pick("first")["result"]["AuthID"] == "b", "old session did not rebalance after quota refresh"
+    assert pick("fourth")["result"]["AuthID"] == "b"
+    assert pick("fifth")["result"]["AuthID"] == "b"
+    assert pick("sixth")["result"]["AuthID"] == "b"
     assert pick("first")["result"]["AuthID"] == "b"
+    assert queries == 6, "quota cache did not refresh once per credential"
+    for _ in range(3):
+        assert pick("")["result"]["AuthID"] == "b"
     assert pick("fixed", key="dedicated")["result"]["AuthID"] == "a"
     denied = pick("fixed", key="dedicated", candidates=("b",))
     assert not denied["ok"] and denied["error"]["code"] == "bound_auth_unavailable", denied
@@ -118,4 +133,4 @@ with tempfile.TemporaryDirectory() as tmp:
 
 assert not errors, errors
 assert not held, "host callback buffers leaked"
-print("Routing ABI: headroom selection, sticky sessions, cache refresh, key isolation, pinning, persistence and reconfigure passed")
+print("Routing ABI: weekly-only Business quota, dual-window balancing, active-session rebalance, nearby-quota rotation, cache refresh, key isolation, pinning, persistence and reconfigure passed")

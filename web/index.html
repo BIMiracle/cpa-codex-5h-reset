@@ -6,13 +6,43 @@
     <title>Codex 五小时重置唤醒</title>
     <style>
       :root {
-        color-scheme: light dark;
-        --bg: #f4f6fb;
+        color-scheme: light;
+        --bg: #f0eee8;
+        --card: #faf9f5;
+        --text: #2d2a26;
+        --muted: #6d6760;
+        --line: #e3e1db;
+        --hover: #e9e6df;
+        --focus: #8b8680;
+        --accent: #726d67;
+        --button: #8b8680;
+        --button-hover: #7f7a74;
+        --error: #c65746;
+        --badge: #8b86802e;
+        --shadow: 0 1px 2px #00000014;
+        --backdrop: #2d2a2670;
+      }
+      :root[data-theme="white"] {
+        --bg: #fff;
         --card: #fff;
-        --text: #17233b;
-        --muted: #64748b;
-        --line: #dce3ee;
-        --accent: #315cda;
+        --line: #e5e5e5;
+        --hover: #f6f6f6;
+      }
+      :root[data-theme="dark"] {
+        color-scheme: dark;
+        --bg: #1d1b18;
+        --card: #151412;
+        --text: #f6f4f1;
+        --muted: #c9c3bb;
+        --line: #3a3530;
+        --hover: #2e2a26;
+        --focus: #a6a099;
+        --accent: #a6a099;
+        --button-hover: #9a948e;
+        --error: #f1b0a6;
+        --badge: #8b868047;
+        --shadow: 0 1px 3px #0000004d;
+        --backdrop: #0009;
       }
       * {
         box-sizing: border-box;
@@ -34,7 +64,7 @@
       header {
         display: flex;
         justify-content: space-between;
-        align-items: center;
+        align-items: flex-end;
         gap: 20px;
         margin-bottom: 24px;
       }
@@ -62,6 +92,7 @@
         border-radius: 14px;
         padding: 24px;
         margin-bottom: 20px;
+        box-shadow: var(--shadow);
       }
       .row {
         display: flex;
@@ -79,6 +110,7 @@
         font-size: 13px;
         color: var(--muted);
       }
+      fieldset { min-width: 0; }
       input,
       select,
       textarea,
@@ -88,7 +120,7 @@
         border: 1px solid var(--line);
         padding: 9px 12px;
       }
-      input:not([type="checkbox"]),
+      input:not([type="checkbox"]):not([type="radio"]),
       select,
       textarea {
         width: 100%;
@@ -101,9 +133,28 @@
         cursor: pointer;
       }
       button.primary {
-        background: var(--accent);
+        background: var(--button);
         color: white;
-        border-color: var(--accent);
+        border-color: var(--button);
+      }
+      button:not(:disabled):hover {
+        background: var(--hover);
+      }
+      button.primary:not(:disabled):hover {
+        background: var(--button-hover);
+        border-color: var(--button-hover);
+      }
+      :is(input, select, textarea, button):focus-visible {
+        outline: 2px solid var(--focus);
+        outline-offset: 3px;
+      }
+      input[type="checkbox"], input[type="radio"] {
+        accent-color: var(--button);
+      }
+      input::placeholder,
+      textarea::placeholder {
+        color: var(--muted);
+        opacity: 0.8;
       }
       button:disabled {
         opacity: 0.5;
@@ -119,7 +170,7 @@
         color: var(--accent);
       }
       .error {
-        color: #c13737 !important;
+        color: var(--error) !important;
       }
       .table-wrap {
         overflow: auto;
@@ -147,13 +198,15 @@
         width: 150px;
       }
       dialog {
+        background: var(--card);
+        color: var(--text);
         border: 1px solid var(--line);
         border-radius: 14px;
         max-width: 540px;
         padding: 28px;
       }
       dialog::backdrop {
-        background: #10203a70;
+        background: var(--backdrop);
       }
       #logs {
         max-height: 320px;
@@ -176,15 +229,57 @@
       .badge {
         padding: 4px 10px;
         border-radius: 20px;
-        background: #315cda15;
+        background: var(--badge);
         color: var(--accent);
       }
+      .header-tools {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: flex-end;
+        gap: 12px;
+      }
+      [hidden] { display: none !important; }
+      h3 { font-size: 15px; margin: 0 0 12px; }
+      .date-settings { border-top: 1px solid var(--line); margin-top: 24px; padding-top: 24px; }
+      .date-modes { margin: 18px 0; gap: 20px; }
+      .date-modes label { display: flex; gap: 8px; align-items: center; color: var(--text); }
+      .date-range { max-width: 520px; display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+      .calendar-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin: 24px 0 12px; }
+      .calendar-heading h3 { margin: 0; }
+      .calendar-nav { display: flex; gap: 8px; }
+      .calendar-nav button { padding: 5px 10px; font-size: 12px; }
+      .calendar-nav button:disabled { cursor: default; }
+      .calendar-weekdays, .calendar { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 7px; }
+      .calendar-weekdays { margin-top: 18px; text-align: center; font-size: 13px; color: var(--muted); }
+      .calendar { margin: 8px 0 16px; }
+      .calendar-day { text-align: center; min-height: 96px; padding: 8px 4px; white-space: normal; overflow-wrap: anywhere; }
+      .calendar-day strong { display: block; width: 30px; height: 30px; line-height: 30px; margin: 0 auto 4px; font-size: 18px; font-weight: 500; border-radius: 50%; }
+      .calendar-day span { display: block; font-size: 12px; color: var(--muted); }
+      .calendar-day.holiday, .calendar-day.weekend { background: var(--hover); }
+      .calendar-day:disabled { opacity: 1; cursor: default; }
+      .calendar-day.adjacent { color: var(--muted); background: transparent; }
+      .calendar-day.adjacent strong, .calendar-day.adjacent span { opacity: 0.55; }
+      .calendar-day.today strong { color: var(--card); background: var(--text); opacity: 1; }
+      .calendar-day.skipped { border-style: dashed; }
+      .calendar-day.selected { border: 2px solid var(--focus); background: var(--badge); padding: 7px 3px; }
+      .calendar-day.wake { border: 2px solid var(--focus); }
+      .holiday-year { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 8px 0; font-size: 12px; color: var(--muted); }
+      .holiday-year button { padding: 4px 8px; font-size: 12px; }
+      .holiday-tools { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-top: 16px; }
+      .holiday-upload { margin-top: 20px; }
+      .holiday-upload-controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; margin-top: 12px; }
+      .holiday-upload-controls label { width: 340px; max-width: 100%; min-width: 0; }
+      .holiday-upload-controls input[type="file"] { margin-top: 6px; }
+      #holiday-import:disabled { cursor: not-allowed; }
+      .holiday-template { margin: 12px 0; font-size: 12px; color: var(--muted); }
+      .holiday-template summary { cursor: pointer; width: fit-content; }
+      .holiday-template pre { background: var(--hover); color: var(--text); padding: 12px; border-radius: 7px; white-space: pre-wrap; overflow-wrap: anywhere; }
       @media (max-width: 750px) {
         .grid {
           grid-template-columns: 1fr;
         }
         header {
-          align-items: flex-start;
           flex-direction: column;
         }
         main {
@@ -193,16 +288,12 @@
         section {
           padding: 18px;
         }
-      }
-      @media (prefers-color-scheme: dark) {
-        :root {
-          --bg: #101723;
-          --card: #192233;
-          --text: #e6edf9;
-          --muted: #9daec6;
-          --line: #303e55;
-          --accent: #90adff;
-        }
+        .calendar-weekdays, .calendar { gap: 3px; }
+        .calendar-day { min-height: 80px; padding: 6px 2px; }
+        .calendar-day.selected { padding: 5px 1px; }
+        .calendar-day span { font-size: 11px; }
+        .calendar-day .calendar-action { display: none; }
+        .date-range { grid-template-columns: 1fr; }
       }
     </style>
   </head>
@@ -212,19 +303,15 @@
         <div>
           <div class="tag">CPA PLUGIN · 5H RESET</div>
           <h1>Codex 五小时重置唤醒</h1>
-          <p>按账号等待实际重置时间，独立唤醒与重试。</p>
+          <p>仅为 Plus 账号等待实际重置时间，独立唤醒与重试。</p>
         </div>
-        <span id="health" class="badge">尚未连接</span>
+        <div class="header-tools">
+          <span id="health" class="badge">尚未连接</span>
+        </div>
       </header>
       <section>
         <div class="row">
-          <label class="grow"
-            >CPA 管理密钥<input
-              id="key"
-              type="password"
-              autocomplete="off"
-              placeholder="输入 Management Key（仅保留在当前页面内存）" /></label
-          ><button id="connect" class="primary">连接 / 刷新配置</button
+          <button id="connect" class="primary">刷新账号、额度与配置</button
           ><button id="notify">开启网页通知</button>
         </div>
         <p class="small">
@@ -234,17 +321,21 @@
       </section>
       <section>
         <div class="row" style="justify-content: space-between">
-          <h2>账号与五小时额度</h2>
+          <h2>账号与额度</h2>
           <button id="run-all" class="primary" disabled>全部唤醒</button>
         </div>
-        <p id="next">连接后显示下次执行时间。</p>
+        <p id="next">正在读取账号与下次执行时间…</p>
+        <p id="rule-active" class="small"></p>
         <div class="table-wrap">
           <table>
             <thead>
               <tr>
                 <th>账号</th>
-                <th>五小时用量</th>
-                <th>重置时间</th>
+                <th>套餐</th>
+                <th>五小时剩余</th>
+                <th>五小时重置</th>
+                <th>周剩余</th>
+                <th>周重置</th>
                 <th>状态</th>
                 <th>重试</th>
                 <th>下次尝试</th>
@@ -255,7 +346,7 @@
           </table>
         </div>
         <p class="small">
-          请求成功不等于上游额度已重置；“新窗口”仅为时间信号判断。额度未知时会明确显示。
+          五小时重置唤醒仅适用于 Plus，Business Premium、其他套餐及套餐未知的账号不参与。请求成功不等于上游额度已重置；“新窗口”仅为时间信号判断。
         </p>
       </section>
       <section>
@@ -280,10 +371,9 @@
                   <option>max</option>
                 </select></label
               ><label
-                >时区<input
-                  id="timezone"
-                  required
-                  placeholder="Asia/Singapore" /></label
+                >时区<select id="timezone" required>
+                  <option value="Asia/Singapore">新加坡 · Asia/Singapore</option>
+                </select></label
               ><label
                 >最大重试次数<input
                   id="retries"
@@ -305,8 +395,8 @@
               默认首次请求 + 3 次重试。已知未来重置时间时等待；否则每隔 30
               秒重试。
             </p>
-            <label><input id="quota-routing" type="checkbox" /> 新会话优先使用五小时剩余额度更多的账号</label>
-            <p class="small">同一会话继续使用已绑定账号；账号不可用时自动切换。默认关闭，保存后生效。如已使用其他账号分配插件，请先按 README 迁移 Key 绑定规则。</p>
+            <label><input id="quota-routing" type="checkbox" /> 按周和五小时剩余额度均衡分配</label>
+            <p class="small">同优先级账号先比较周余量，再比较五小时余量；相差 5 个百分点以内轮询。已有会话在周用量差超过 10 个百分点、或周用量接近但五小时用量差超过 20 个百分点时重新分配。Business Premium 仅返回周额度时也参与；额度未知时仍参与，任一已知窗口耗尽则跳过。默认关闭，保存后生效。如已使用其他账号分配插件，请先按 README 迁移 Key 绑定规则。</p>
             <div class="grid" style="margin-top: 20px">
               <div>
                 <label>每日时点（全部关闭后仍可手动唤醒）</label>
@@ -316,7 +406,7 @@
               <div>
                 <label
                   ><input id="all-auths" type="checkbox" /> 自动包含全部启用的
-                  Codex 账号</label
+                  Codex Plus 账号</label
                 >
                 <div id="auth-select"></div>
               </div>
@@ -329,6 +419,61 @@
                   默认关闭；运行 CPA
                   的用户需要有桌面会话。与网页通知同时开启时可能分别提醒。
                 </p>
+              </div>
+            </div>
+            <div class="date-settings">
+              <h3>日期安排</h3>
+              <label><input id="skip-holidays" type="checkbox" /> 法定节假日</label>
+              <p class="small">勾选后，中国大陆放假日和普通周末不自动唤醒，调休补班日照常运行。手动“立即唤醒”及其重试仍可执行。</p>
+              <div class="date-modes row" role="group" aria-label="一次性日期规则">
+                <label><input id="rule-none" name="date-rule" type="radio" value="none" checked /> 按默认规则</label>
+                <label><input id="rule-exclude" name="date-rule" type="radio" value="exclude" /> 排除日期</label>
+                <label><input id="rule-tomorrow" name="date-rule" type="radio" value="wake_tomorrow" /> 明天唤醒</label>
+              </div>
+              <div id="rule-range" class="date-range" hidden>
+                <label>开始日期<input id="exclude-start" type="date" /></label>
+                <label>结束日期<input id="exclude-end" type="date" /></label>
+              </div>
+              <p id="rule-draft" class="small">日期安排在保存设置后生效。</p>
+              <p class="small">排除区间包含首尾两天，只生效一次。明天唤醒覆盖明天的节假日和周末限制；两者互斥，到期恢复默认规则。</p>
+              <div class="calendar-heading">
+                <h3 id="calendar-title" aria-live="polite">月历</h3>
+                <div class="calendar-nav" aria-label="切换月份">
+                  <button id="calendar-prev" type="button" aria-label="查看上一个月">‹ 上个月</button>
+                  <button id="calendar-current" type="button">本月</button>
+                  <button id="calendar-next" type="button" aria-label="查看下一个月">下个月 ›</button>
+                </div>
+              </div>
+              <p class="small">周一至周日排列，灰色日期属于相邻月份。选择“排除日期”后，可点选今天起未来 30 天内的起止日期，或使用上方日期输入框。</p>
+              <div id="holiday-meta"></div>
+              <p id="holiday-error" class="small error" role="status" aria-live="polite"></p>
+              <div class="calendar-weekdays" aria-hidden="true"><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span><span>日</span></div>
+              <div id="calendar" class="calendar" aria-label="月历日期安排"></div>
+              <p class="small">圆形标记为今天；虚线框表示自动跳过，实线框表示一次性日期安排。节假日和补班标注可在相邻月份一并查看。</p>
+              <div class="holiday-tools">
+                <button id="holiday-refresh" type="button">刷新节假日数据</button>
+              </div>
+              <div class="holiday-upload">
+                <p class="small">如果节假日数据获取失败或内容有误，可自行上传年度节假日 JSON 文件。请先预览年份与放假、补班天数，再确认导入。</p>
+                <details class="holiday-template">
+                  <summary>查看 JSON 数据格式模板</summary>
+                  <p>以下为 holiday-cn 格式示例，请按实际年份补齐全年放假日和调休补班日，并保存为 UTF-8 编码的 .json 文件（最大 2 MiB）。</p>
+                  <pre><code>{
+  "year": 2026,
+  "days": [
+    { "date": "2026-10-01", "name": "节日名称", "isOffDay": true },
+    { "date": "2026-10-10", "name": "调休补班名称", "isOffDay": false }
+  ]
+}</code></pre>
+                  <p>year 为年度；date 使用 YYYY-MM-DD；name 为节日或补班名称；isOffDay 为布尔值，true 表示放假，false 表示补班。普通周末无需逐日列出，同一日期不可重复或冲突。示例仅展示格式，不是完整年度数据。</p>
+                </details>
+                <div class="holiday-upload-controls">
+                  <label>上传年度节假日 JSON<input id="holiday-file" type="file" accept=".json,application/json" /></label>
+                  <button id="holiday-preview" type="button">预览导入</button>
+                  <button id="holiday-import" type="button" disabled>确认导入</button>
+                </div>
+                <p id="import-preview" class="small" role="status"></p>
+                <p class="small">支持提莫年度接口和 holiday-cn 文件。手动导入优先于在线数据；更换文件后须重新预览。导入、清除和数据刷新直接生效。</p>
               </div>
             </div>
             <div class="actions">

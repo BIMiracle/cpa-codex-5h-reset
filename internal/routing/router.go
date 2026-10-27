@@ -1,4 +1,4 @@
-// Package routing selects Codex credentials by five-hour headroom while retaining
+// Package routing balances Codex credentials by weekly and five-hour quota while retaining
 // a caller-scoped, model-scoped binding for the lifetime of each active session.
 package routing
 
@@ -59,14 +59,22 @@ type sessionBinding struct {
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
+const (
+	quotaBalanceTolerance   = 5.0
+	weeklyRebindTolerance   = 10.0
+	fiveHourRebindTolerance = 20.0
+)
+
 type diskState struct {
 	Schema   int                       `json:"schema"`
 	Bindings map[string]sessionBinding `json:"bindings"`
+	Last     map[string]string         `json:"last,omitempty"`
 }
 
 type Plan struct {
 	config Config
 	loaded map[string]sessionBinding
+	last   map[string]string
 }
 
 type Router struct {
@@ -106,7 +114,7 @@ func (r *Router) Prepare(c Config) (Plan, error) {
 		return Plan{}, errors.New("routing_state_read_failed")
 	}
 	var state diskState
-	if json.Unmarshal(raw, &state) != nil || state.Schema != 1 || len(state.Bindings) > 4096 {
+	if json.Unmarshal(raw, &state) != nil || state.Schema != 1 || len(state.Bindings) > 4096 || len(state.Last) > 4096 {
 		return Plan{}, errors.New("invalid_routing_state")
 	}
 	for key, binding := range state.Bindings {
@@ -115,7 +123,14 @@ func (r *Router) Prepare(c Config) (Plan, error) {
 			return Plan{}, errors.New("invalid_routing_state")
 		}
 	}
+	for key, id := range state.Last {
+		decoded, err := hex.DecodeString(key)
+		if err != nil || len(decoded) != sha256.Size || id == "" {
+			return Plan{}, errors.New("invalid_routing_state")
+		}
+	}
 	p.loaded = state.Bindings
+	p.last = state.Last
 	return p, nil
 }
 
@@ -127,6 +142,10 @@ func (r *Router) Configure(p Plan) {
 		r.loadedFile = p.config.StateFile
 		if r.bindings == nil {
 			r.bindings = map[string]sessionBinding{}
+		}
+		r.last = p.last
+		if r.last == nil {
+			r.last = map[string]string{}
 		}
 	}
 	r.config = p.config
@@ -183,10 +202,6 @@ func (r *Router) Pick(req Request) Response {
 		return Response{}
 	}
 	identity := sessionID(req.Options)
-	if identity == "" && rule == nil {
-		// No stable identity: retain the host's native affinity/fallback behavior.
-		return Response{}
-	}
 	now := r.now()
 	providerScope := "codex"
 	if !allCodex {
@@ -203,12 +218,46 @@ func (r *Router) Pick(req Request) Response {
 	}
 	scope := digest(key + "\x00" + providerScope + "\x00" + strings.ToLower(strings.TrimSpace(req.Model)))
 	bindingKey := digest(scope + "\x00" + identity)
-	if identity != "" {
+	if allCodex {
+		binding, bound := r.bindings[bindingKey]
+		bound = identity != "" && bound && now.Before(binding.ExpiresAt)
+		generation := r.generation
+		// Active sessions refresh expired observations too. They never wait for
+		// an unrelated refresh already in progress; that refresh will inform the
+		// next turn instead of blocking a working session.
+		r.mu.Unlock()
+		r.refresh(pool, now, !bound)
+		r.mu.Lock()
+		if generation != r.generation {
+			// Re-evaluate key isolation and candidates against the new configuration.
+			r.mu.Unlock()
+			decision := r.Pick(req)
+			r.mu.Lock()
+			return decision
+		}
+		if identity != "" {
+			if id := r.reuse(bindingKey, pool, now); id != "" {
+				return Response{Handled: true, AuthID: id}
+			}
+		}
+		eligible := pool[:0]
+		for _, c := range pool {
+			if r.quotaAvailable(c.ID, now) {
+				eligible = append(eligible, c)
+			}
+		}
+		if len(eligible) == 0 {
+			return reject("quota_exhausted")
+		}
+		pool = eligible
+	} else if identity != "" {
 		if id := r.reuse(bindingKey, pool, now); id != "" {
 			return Response{Handled: true, AuthID: id}
 		}
 	}
-	// Credential priority governs new bindings; an existing binding above outranks it.
+	// Honor credential priorities after excluding exhausted quota, so lower tiers
+	// can take over. Balance weekly consumption first, then short-term headroom;
+	// nearby observations still rotate to spread concurrent new sessions.
 	priority := pool[0].Priority
 	for _, c := range pool {
 		if c.Priority > priority {
@@ -223,48 +272,7 @@ func (r *Router) Pick(req Request) Response {
 	}
 	pool = eligible
 	if allCodex {
-		generation := r.generation
-		// Quota transport must not hold up requests for already-bound sessions.
-		r.mu.Unlock()
-		r.refresh(pool, now)
-		r.mu.Lock()
-		if generation != r.generation {
-			// Re-evaluate key isolation and candidates against the new configuration.
-			r.mu.Unlock()
-			decision := r.Pick(req)
-			r.mu.Lock()
-			return decision
-		}
-		if identity != "" {
-			if id := r.reuse(bindingKey, pool, now); id != "" {
-				return Response{Handled: true, AuthID: id}
-			}
-		}
-		known, unknown := []Candidate{}, []Candidate{}
-		best := 101.0
-		for _, c := range pool {
-			q := r.quotas[c.ID]
-			if !q.Known || !now.Before(q.ResetAt) || now.Sub(q.ObservedAt) > r.config.quotaTTL {
-				unknown = append(unknown, c)
-				continue
-			}
-			if q.UsedPercent >= 100 {
-				continue
-			}
-			if q.UsedPercent < best {
-				best, known = q.UsedPercent, nil
-			}
-			if q.UsedPercent == best {
-				known = append(known, c)
-			}
-		}
-		if len(known) > 0 {
-			pool = known
-		} else if len(unknown) > 0 {
-			pool = unknown
-		} else {
-			return reject("five_hour_quota_exhausted")
-		}
+		pool = r.balanced(pool, now, quotaBalanceTolerance, quotaBalanceTolerance)
 	}
 	sort.Slice(pool, func(i, j int) bool { return pool[i].ID < pool[j].ID })
 	index := sort.Search(len(pool), func(i int) bool { return pool[i].ID > r.last[scope] })
@@ -272,16 +280,19 @@ func (r *Router) Pick(req Request) Response {
 		index = 0
 	}
 	picked := pool[index].ID
-	if len(r.last) >= 4096 {
-		r.last = map[string]string{}
-	}
-	r.last[scope] = picked
 	if identity != "" {
 		r.prune(now)
 		if _, exists := r.bindings[bindingKey]; !exists && len(r.bindings) >= 4096 {
 			// Do not evict an active session and silently move it on its next turn.
 			return reject("routing_session_capacity")
 		}
+	}
+	if len(r.last) >= 4096 {
+		r.last = map[string]string{}
+	}
+	previousLast, hadLast := r.last[scope]
+	r.last[scope] = picked
+	if identity != "" {
 		previous, existed := r.bindings[bindingKey]
 		r.bindings[bindingKey] = sessionBinding{AuthID: picked, ExpiresAt: now.Add(r.config.sessionTTL)}
 		if err := r.save(now); err != nil {
@@ -290,22 +301,81 @@ func (r *Router) Pick(req Request) Response {
 			} else {
 				delete(r.bindings, bindingKey)
 			}
+			if hadLast {
+				r.last[scope] = previousLast
+			} else {
+				delete(r.last, scope)
+			}
 			return reject("routing_state_write_failed")
 		}
 	}
-	r.host.Log("info", "quota_routing_new_binding", map[string]any{"credential": picked, "model": req.Model, "reason": "most_five_hour_remaining"})
+	r.host.Log("info", "quota_routing_new_binding", map[string]any{"credential": picked, "model": req.Model, "reason": "weekly_then_five_hour_balance"})
 	return Response{Handled: true, AuthID: picked}
 }
 
-func (r *Router) refresh(pool []Candidate, now time.Time) {
-	r.refreshMu.Lock()
+// Unknown, stale and reset observations must not permanently exclude an account.
+// Only a fresh, confirmed exhausted window makes an otherwise usable auth ineligible.
+func (r *Router) quotaAvailable(id string, now time.Time) bool {
+	q := r.quotas[id]
+	if now.Sub(q.ObservedAt) >= r.config.quotaTTL {
+		return true
+	}
+	return !(q.Known && now.Before(q.ResetAt) && q.UsedPercent >= 100) &&
+		!(q.Weekly != nil && now.Before(q.Weekly.ResetAt) && q.Weekly.UsedPercent >= 100)
+}
+
+// balanced preserves candidates with unknown windows rather than interpreting
+// missing usage as zero. A weekly-only plan can compete on its actual limit.
+func (r *Router) balanced(pool []Candidate, now time.Time, weeklyTolerance, fiveHourTolerance float64) []Candidate {
+	for _, window := range []struct {
+		weekly    bool
+		tolerance float64
+	}{{true, weeklyTolerance}, {false, fiveHourTolerance}} {
+		best := 101.0
+		usage := func(id string) (float64, bool) {
+			q := r.quotas[id]
+			if now.Sub(q.ObservedAt) >= r.config.quotaTTL {
+				return 0, false
+			}
+			if window.weekly {
+				if q.Weekly != nil && now.Before(q.Weekly.ResetAt) {
+					return q.Weekly.UsedPercent, true
+				}
+			} else if q.Known && now.Before(q.ResetAt) {
+				return q.UsedPercent, true
+			}
+			return 0, false
+		}
+		for _, c := range pool {
+			if used, known := usage(c.ID); known && used < best {
+				best = used
+			}
+		}
+		eligible := pool[:0]
+		for _, c := range pool {
+			if used, known := usage(c.ID); !known || used <= best+window.tolerance {
+				eligible = append(eligible, c)
+			}
+		}
+		pool = eligible
+	}
+	return pool
+}
+
+func (r *Router) refresh(pool []Candidate, now time.Time, wait bool) {
+	if wait {
+		r.refreshMu.Lock()
+	} else if !r.refreshMu.TryLock() {
+		return
+	}
 	defer r.refreshMu.Unlock()
 	r.mu.Lock()
 	ttl := r.config.quotaTTL
 	needed := []Candidate{}
 	for _, c := range pool {
 		q, queried := r.quotas[c.ID], r.queried[c.ID]
-		if queried.IsZero() || now.Sub(queried) >= ttl || (q.Known && !now.Before(q.ResetAt)) {
+		if queried.IsZero() || now.Sub(queried) >= ttl || (q.Known && !now.Before(q.ResetAt)) ||
+			(q.Weekly != nil && !now.Before(q.Weekly.ResetAt)) {
 			needed = append(needed, c)
 		}
 	}
@@ -347,11 +417,30 @@ func (r *Router) refresh(pool []Candidate, now time.Time) {
 	}
 }
 
-// reuse is called with mu held, before and after a potentially concurrent refresh.
+// reuse is called with mu held after the quota refresh attempt.
 func (r *Router) reuse(key string, pool []Candidate, now time.Time) string {
 	if b, ok := r.bindings[key]; ok && now.Before(b.ExpiresAt) {
 		for _, c := range pool {
 			if c.ID == b.AuthID {
+				if strings.EqualFold(c.Provider, "codex") && !r.quotaAvailable(c.ID, now) {
+					return ""
+				}
+				if strings.EqualFold(c.Provider, "codex") {
+					peers := make([]Candidate, 0, len(pool))
+					for _, peer := range pool {
+						if strings.EqualFold(peer.Provider, c.Provider) && peer.Priority == c.Priority && r.quotaAvailable(peer.ID, now) {
+							peers = append(peers, peer)
+						}
+					}
+					peers = r.balanced(peers, now, weeklyRebindTolerance, fiveHourRebindTolerance)
+					keep := false
+					for _, peer := range peers {
+						keep = keep || peer.ID == c.ID
+					}
+					if !keep {
+						return ""
+					}
+				}
 				b.ExpiresAt = now.Add(r.config.sessionTTL)
 				r.bindings[key] = b
 				if now.Sub(r.lastWrite) >= time.Minute {
@@ -374,7 +463,7 @@ func (r *Router) prune(now time.Time) {
 
 func (r *Router) save(now time.Time) error {
 	r.prune(now)
-	raw, err := json.Marshal(diskState{Schema: 1, Bindings: r.bindings})
+	raw, err := json.Marshal(diskState{Schema: 1, Bindings: r.bindings, Last: r.last})
 	if err == nil {
 		err = os.MkdirAll(filepath.Dir(r.config.StateFile), 0700)
 	}
@@ -414,7 +503,7 @@ func (r *Router) Status() map[string]any {
 	for id, q := range r.quotas {
 		quotas[id] = q
 	}
-	return map[string]any{"enabled": r.config.Enabled, "session_ttl": r.config.SessionTTL, "quota_cache_ttl": r.config.QuotaCacheTTL, "active_bindings": len(r.bindings), "state_error": r.stateError, "quotas": quotas}
+	return map[string]any{"enabled": r.config.Enabled, "strategy": "weekly-then-five-hour", "session_ttl": r.config.SessionTTL, "quota_cache_ttl": r.config.QuotaCacheTTL, "active_bindings": len(r.bindings), "state_error": r.stateError, "quotas": quotas}
 }
 
 func digest(value string) string {

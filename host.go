@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os/exec"
 	"runtime"
+	"strings"
 	"time"
 )
 
@@ -24,7 +25,23 @@ func (host) ListAuths() ([]keeper.Auth, error) {
 		Files []keeper.Auth `json:"files"`
 	}
 	err = json.Unmarshal(raw, &result)
-	return result.Files, err
+	if err != nil {
+		return nil, err
+	}
+	for i := range result.Files {
+		a := &result.Files[i]
+		a.PlanType = strings.ToLower(strings.TrimSpace(a.PlanType))
+		if !strings.EqualFold(a.Provider, "codex") || a.Disabled || a.PlanType != "" || a.AuthIndex == "" {
+			continue
+		}
+		// The CPA auth-list ABI omits plan metadata. Read the credential locally;
+		// retain only the plan, never the token or any other credential fields.
+		credential, err := invokeHost("host.auth.get", map[string]any{"auth_index": a.AuthIndex})
+		if err == nil {
+			a.PlanType = credentialPlan(credential)
+		}
+	}
+	return result.Files, nil
 }
 func (host) Execute(a keeper.Auth, c keeper.Config) (keeper.Execution, error) {
 	payload := map[string]any{"model": c.Model, "messages": []map[string]string{{"role": "user", "content": c.Prompt}}, "stream": false}

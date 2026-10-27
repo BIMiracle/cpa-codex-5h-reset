@@ -20,16 +20,19 @@ func TestSchedulerRegistrationWireProtocolAndStatus(t *testing.T) {
 	invokeHost = func(method string, input any) (json.RawMessage, error) {
 		switch method {
 		case "host.auth.list":
-			return json.RawMessage(`{"files":[{"id":"a","auth_index":"a","provider":"codex"},{"id":"b","auth_index":"b","provider":"codex"}]}`), nil
+			return json.RawMessage(`{"files":[{"id":"a","auth_index":"a","provider":"codex","plan_type":"self_serve_business_prolite"},{"id":"b","auth_index":"b","provider":"codex","plan_type":"plus"},{"id":"c","auth_index":"c","provider":"codex","plan_type":"plus"}]}`), nil
 		case "host.auth.get":
 			id := input.(map[string]any)["auth_index"]
 			return json.Marshal(map[string]any{"json": map[string]any{"access_token": "secret-" + id.(string)}})
 		case "host.http.do":
-			used := 76
-			if input.(map[string]any)["Headers"].(http.Header).Get("Authorization") == "Bearer secret-b" {
-				used = 21
+			id := input.(map[string]any)["Headers"].(http.Header).Get("Authorization")
+			weekly := map[string]int{"Bearer secret-a": 32, "Bearer secret-b": 2, "Bearer secret-c": 4}[id]
+			windows := map[string]any{"primary_window": map[string]any{"limit_window_seconds": 604800, "used_percent": weekly, "reset_at": time.Now().Add(7 * 24 * time.Hour).Unix()}}
+			if id != "Bearer secret-a" {
+				used := map[string]int{"Bearer secret-b": 6, "Bearer secret-c": 24}[id]
+				windows["secondary_window"] = map[string]any{"limit_window_seconds": 18000, "used_percent": used, "reset_at": time.Now().Add(time.Hour).Unix()}
 			}
-			body := []byte(fmt.Sprintf(`{"rate_limit":{"primary_window":{"limit_window_seconds":18000,"used_percent":%d,"reset_at":%d}}}`, used, time.Now().Add(time.Hour).Unix()))
+			body, _ := json.Marshal(map[string]any{"rate_limit": windows})
 			return json.Marshal(map[string]any{"StatusCode": 200, "Body": body})
 		case "host.log":
 			return json.RawMessage(`{}`), nil
@@ -43,9 +46,12 @@ func TestSchedulerRegistrationWireProtocolAndStatus(t *testing.T) {
 	if err != nil || !strings.Contains(string(raw), `"scheduler":true`) || !strings.Contains(string(raw), `"scheduler_across_priorities":true`) {
 		t.Fatalf("scheduler capability missing: %s %v", raw, err)
 	}
-	raw, err = handleMethod("scheduler.pick", []byte(`{"Providers":["codex"],"Model":"gpt-6.1-sol","Options":{"Headers":{"Authorization":["Bearer client"],"Session_id":["new"]}},"Candidates":[{"ID":"a","Provider":"codex"},{"ID":"b","Provider":"codex"}]}`))
-	if err != nil || !strings.Contains(string(raw), `"AuthID":"b"`) {
-		t.Fatalf("wrong native ABI selection: %s %v", raw, err)
+	for i := range 3 {
+		request := fmt.Sprintf(`{"Providers":["codex"],"Model":"gpt-6.1-sol","Options":{"Headers":{"Authorization":["Bearer client"],"Session_id":["new-%d"]}},"Candidates":[{"ID":"a","Provider":"codex"},{"ID":"b","Provider":"codex"},{"ID":"c","Provider":"codex"}]}`, i)
+		raw, err = handleMethod("scheduler.pick", []byte(request))
+		if err != nil || !strings.Contains(string(raw), `"AuthID":"b"`) {
+			t.Fatalf("wrong native ABI selection: %s %v", raw, err)
+		}
 	}
 	raw, err = handleMethod("scheduler.pick", []byte(`{"Options":{"Metadata":{"pinned_auth_id":"a"}},"Candidates":[{"ID":"a","Provider":"codex"}]}`))
 	if err != nil || !strings.Contains(string(raw), `"AuthID":"a"`) {
@@ -54,7 +60,7 @@ func TestSchedulerRegistrationWireProtocolAndStatus(t *testing.T) {
 	raw, err = handleManagement(managementRequest{Method: "GET", Path: "/v0/management/plugins/" + pluginID + "/status"})
 	var env envelope
 	var result managementResponse
-	if err != nil || json.Unmarshal(raw, &env) != nil || json.Unmarshal(env.Result, &result) != nil || !strings.Contains(string(result.Body), `"quota_routing":{"active_bindings":1`) || strings.Contains(string(result.Body), "secret-") {
+	if err != nil || json.Unmarshal(raw, &env) != nil || json.Unmarshal(env.Result, &result) != nil || !strings.Contains(string(result.Body), `"quota_routing":{"active_bindings":3`) || !strings.Contains(string(result.Body), `"strategy":"weekly-then-five-hour"`) || !strings.Contains(string(result.Body), `"weekly":`) || strings.Contains(string(result.Body), "secret-") {
 		t.Fatalf("routing status absent or unsafe: %s %v", raw, err)
 	}
 }

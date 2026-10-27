@@ -1,6 +1,7 @@
 """Load the release library against mock CPA callbacks; no network or real tokens."""
 import base64
 import ctypes as C
+import datetime
 import json
 import pathlib
 import sys
@@ -27,14 +28,19 @@ def host_call(ctx, method, data, length, output):
         method = method.decode()
         request = json.loads(C.string_at(data, length))
         if method == 'host.auth.list':
-            result = {'files': [{'id': 'mock-account', 'auth_index': 'mock-index', 'provider': 'codex'}]}
+            result = {'files': [
+                {'id': 'mock-account', 'auth_index': 'mock-index', 'provider': 'codex'},
+                {'id': 'business-account', 'auth_index': 'business-index', 'provider': 'codex'}]}
         elif method == 'host.model.execute':
             assert request['auth_id'] == 'mock-account'
             assert request['forced_provider'] == 'codex'
             executions += 1
             result = {'status_code': 500 if executions == 1 else 200}
         elif method == 'host.auth.get':
-            result = {'json': {'access_token': 'mock-secret', 'account_id': 'mock-account'}}
+            plan = 'business_premium' if request['auth_index'] == 'business-index' else 'plus'
+            claims = {'https://api.openai.com/auth': {'chatgpt_plan_type': plan}}
+            token = 'header.' + base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip('=') + '.signature'
+            result = {'json': {'access_token': 'mock-secret', 'account_id': 'mock-account', 'id_token': token}}
         elif method == 'host.http.do':
             assert request['URL'] == 'https://chatgpt.com/backend-api/wham/usage'
             quota = {'rate_limit': {'primary_window': {'limit_window_seconds': 18000,
@@ -90,7 +96,26 @@ with tempfile.TemporaryDirectory() as tmp:
     routes = call('management.register', {})
     assert any(r.get('Menu') == 'Codex 五小时重置唤醒' for r in routes['resources'])
     api = '/v0/management/plugins/cpa-codex-5h-reset'
+    assert any(r['Path'] == '/plugins/cpa-codex-5h-reset/holidays/import' for r in routes['routes'])
     assert management('GET', '/v0/resource/plugins/cpa-codex-5h-reset/ui')[0] == 200
+    # Import all possible display years before querying the calendar: this smoke
+    # test must never contact real holiday services, even across New Year.
+    year = datetime.datetime.now(datetime.timezone.utc).year
+    for annual_year in (year - 1, year, year + 1):
+        holiday = {'year': annual_year, 'days': [{'date': f'{annual_year}-01-01', 'name': 'ABI test holiday', 'isOffDay': True}]}
+        assert management('POST', api + '/holidays/import', {'data': holiday, 'preview': True})[0] == 200
+        if annual_year == year - 1:
+            assert not pathlib.Path(state + '.holidays.json').exists(), 'preview wrote holiday state'
+        assert management('POST', api + '/holidays/import', {'data': holiday, 'preview': False})[0] == 200
+    code, calendar_raw = management('GET', api + '/holidays')
+    calendar = json.loads(calendar_raw)
+    assert code == 200 and len(calendar['days']) == 30
+    display = calendar['display_days']
+    assert len(display) >= 84 and datetime.date.fromisoformat(display[0]['date']).weekday() == 0
+    assert datetime.date.fromisoformat(display[-1]['date']).weekday() == 6
+    assert all(day['data_known'] for day in display), 'month display lost imported annual data'
+    assert management('POST', api + '/run', {'auth_id': 'business-account'})[0] == 400
+    assert executions == 0, 'Business Premium must never execute a wake request'
     assert management('POST', api + '/run', {})[0] == 202
     assert management('POST', api + '/run', {})[0] == 409
     deadline = time.time() + 12
@@ -102,13 +127,17 @@ with tempfile.TemporaryDirectory() as tmp:
             break
         time.sleep(0.1)
     assert slots[0]['status'] == 'fresh_window', slots
+    assert len(slots) == 1 and slots[0]['auth_id'] == 'mock-account', slots
     assert slots[0]['attempts'] == 2 and executions == 2, slots
     plugin.stop()
     assert 'mock-secret' not in pathlib.Path(state).read_text()
+    assert 'mock-secret' not in pathlib.Path(state + '.holidays.json').read_text()
     call('plugin.register', {'config_yaml': encoded})
     _, raw = management('GET', api + '/status')
     assert json.loads(raw)['slots'][0]['attempts'] == 2
+    _, calendar_raw = management('GET', api + '/holidays')
+    assert all(y['manual'] for y in json.loads(calendar_raw)['years']), 'holiday import lost after restart'
     plugin.stop()
 assert not errors, errors
 assert not held, 'host buffers leaked'
-print('Native ABI: registration, resource, bound execution, reset wait, retry, conflict, persistence and shutdown passed')
+print('Native ABI: registration, resource, holiday preview/import/calendar persistence, Plus-only wake, bound execution, reset wait, retry, conflict, task persistence and shutdown passed')

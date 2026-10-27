@@ -27,6 +27,7 @@ type managementRequest struct {
 	Method string
 	Path   string
 	Body   []byte
+	Query  map[string][]string
 }
 type managementResponse struct {
 	StatusCode int
@@ -78,7 +79,7 @@ func handleMethod(method string, raw []byte) ([]byte, error) {
 		engine.Stop()
 		return okEnvelope(map[string]any{})
 	case "management.register":
-		return okEnvelope(map[string]any{"routes": []map[string]string{{"Method": "GET", "Path": "/plugins/" + pluginID + "/status"}, {"Method": "POST", "Path": "/plugins/" + pluginID + "/run"}, {"Method": "GET", "Path": "/plugins/" + pluginID + "/logs"}}, "resources": []map[string]string{{"Path": "/ui", "Menu": "Codex 五小时重置唤醒", "Description": "计划、五小时额度、手动唤醒和失败提醒"}, {"Path": "/app.js"}}})
+		return okEnvelope(map[string]any{"routes": []map[string]string{{"Method": "GET", "Path": "/plugins/" + pluginID + "/status"}, {"Method": "POST", "Path": "/plugins/" + pluginID + "/run"}, {"Method": "GET", "Path": "/plugins/" + pluginID + "/logs"}, {"Method": "GET", "Path": "/plugins/" + pluginID + "/account-quotas"}, {"Method": "GET", "Path": "/plugins/" + pluginID + "/holidays"}, {"Method": "POST", "Path": "/plugins/" + pluginID + "/holidays/refresh"}, {"Method": "POST", "Path": "/plugins/" + pluginID + "/holidays/import"}, {"Method": "POST", "Path": "/plugins/" + pluginID + "/holidays/clear-import"}}, "resources": []map[string]string{{"Path": "/ui", "Menu": "Codex 五小时重置唤醒", "Description": "计划、节假日、五小时额度、手动唤醒和失败提醒"}, {"Path": "/app.js"}}})
 	case "management.handle":
 		var req managementRequest
 		if json.Unmarshal(raw, &req) != nil {
@@ -108,6 +109,70 @@ func handleManagement(req managementRequest) ([]byte, error) {
 		}{status, accountRouter.Status()})
 	case req.Method == "GET" && path == api+"/logs":
 		return jsonManagement(200, map[string]any{"logs": engine.Logs()})
+	case req.Method == "GET" && path == api+"/holidays":
+		timezone := ""
+		if values := req.Query["timezone"]; len(values) > 0 {
+			timezone = values[0]
+			if _, err := time.LoadLocation(timezone); err != nil {
+				return jsonManagement(400, map[string]string{"error": "invalid_timezone"})
+			}
+		}
+		return jsonManagement(200, engine.HolidayCalendar(time.Now(), false, timezone))
+	case req.Method == "POST" && path == api+"/holidays/refresh":
+		return jsonManagement(202, engine.HolidayCalendar(time.Now(), true))
+	case req.Method == "POST" && path == api+"/holidays/import":
+		var input struct {
+			Data    json.RawMessage `json:"data"`
+			Preview bool            `json:"preview"`
+		}
+		if len(req.Body) > 3<<20 || json.Unmarshal(req.Body, &input) != nil || len(input.Data) == 0 {
+			return jsonManagement(400, map[string]string{"error": "invalid_holiday_import"})
+		}
+		result, err := engine.ImportHolidays(input.Data, input.Preview, time.Now())
+		if err != nil {
+			code := 400
+			if err.Error() == "holiday_write_failed" {
+				code = 500
+			}
+			return jsonManagement(code, map[string]string{"error": err.Error()})
+		}
+		return jsonManagement(200, result)
+	case req.Method == "POST" && path == api+"/holidays/clear-import":
+		var input struct {
+			Year int `json:"year"`
+		}
+		if json.Unmarshal(req.Body, &input) != nil || input.Year < 1900 || input.Year > 9998 {
+			return jsonManagement(400, map[string]string{"error": "invalid_holiday_year"})
+		}
+		if err := engine.ClearImportedHolidays(input.Year); err != nil {
+			return jsonManagement(500, map[string]string{"error": err.Error()})
+		}
+		return jsonManagement(200, engine.HolidayCalendar(time.Now(), true))
+	case req.Method == "GET" && path == api+"/account-quotas":
+		// Query usage without submitting a model request or creating a wake task.
+		h := host{}
+		auths, err := h.ListAuths()
+		if err != nil {
+			return jsonManagement(502, map[string]string{"error": "account_list_unavailable"})
+		}
+		accounts := []keeper.Auth{}
+		quotas := map[string]keeper.Quota{}
+		for _, a := range auths {
+			if !strings.EqualFold(a.Provider, "codex") {
+				continue
+			}
+			accounts = append(accounts, a)
+			if a.Disabled {
+				continue
+			}
+			now := time.Now()
+			q, err := h.FetchQuota(a, now)
+			if err != nil {
+				q = keeper.Quota{ObservedAt: now, Error: "quota_unavailable"}
+			}
+			quotas[a.ID] = q
+		}
+		return jsonManagement(200, map[string]any{"auths": accounts, "quotas": quotas})
 	case req.Method == "POST" && path == api+"/run":
 		var input struct {
 			AuthID string `json:"auth_id"`

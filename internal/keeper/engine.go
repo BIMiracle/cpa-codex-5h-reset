@@ -21,8 +21,12 @@ type Auth struct {
 	AuthIndex string `json:"auth_index"`
 	Label     string `json:"label"`
 	Provider  string `json:"provider"`
+	PlanType  string `json:"plan_type,omitempty"`
 	Disabled  bool   `json:"disabled"`
 }
+
+func (a Auth) IsPlus() bool { return strings.EqualFold(strings.TrimSpace(a.PlanType), "plus") }
+
 type Execution struct {
 	StatusCode int         `json:"status_code"`
 	Headers    http.Header `json:"headers"`
@@ -59,14 +63,16 @@ type LogEntry struct {
 	Status string    `json:"status,omitempty"`
 }
 type Status struct {
-	Enabled    bool            `json:"enabled"`
-	Config     Config          `json:"config"`
-	Now        time.Time       `json:"now"`
-	Slots      []Slot          `json:"slots"`
-	Auths      []Auth          `json:"auths"`
-	Schedules  []ScheduledTime `json:"schedules"`
-	StateError string          `json:"state_error,omitempty"`
-	AuthError  string          `json:"auth_error,omitempty"`
+	Enabled       bool            `json:"enabled"`
+	Config        Config          `json:"config"`
+	Now           time.Time       `json:"now"`
+	Slots         []Slot          `json:"slots"`
+	Auths         []Auth          `json:"auths"`
+	Schedules     []ScheduledTime `json:"schedules"`
+	StateError    string          `json:"state_error,omitempty"`
+	AuthError     string          `json:"auth_error,omitempty"`
+	EffectiveRule OneTimeRule     `json:"effective_rule"`
+	HolidayStatus HolidayCalendar `json:"holiday_status"`
 }
 type diskState struct {
 	Schema int               `json:"schema"`
@@ -77,13 +83,14 @@ type diskState struct {
 
 var ErrConflict = errors.New("account already has an unfinished task")
 var ErrDisabled = errors.New("plugin is disabled")
-var ErrNoAuth = errors.New("no matching enabled Codex credentials")
+var ErrNoAuth = errors.New("no matching enabled Codex Plus credentials")
 
 type Engine struct {
 	life       sync.Mutex
 	tickMu     sync.Mutex
 	mu         sync.Mutex
 	host       Host
+	holidays   *Holidays
 	cfg        Config
 	slots      map[string]*Slot
 	running    map[string]bool
@@ -100,8 +107,12 @@ type Engine struct {
 	now        func() time.Time
 }
 
-func New(h Host) *Engine {
-	return &Engine{host: h, slots: map[string]*Slot{}, running: map[string]bool{}, seen: map[string]string{}, now: time.Now}
+func New(h Host, holidayFetch ...HolidayFetch) *Engine {
+	var fetch HolidayFetch
+	if len(holidayFetch) > 0 {
+		fetch = holidayFetch[0]
+	}
+	return &Engine{host: h, holidays: NewHolidays(fetch), slots: map[string]*Slot{}, running: map[string]bool{}, seen: map[string]string{}, now: time.Now}
 }
 func (e *Engine) Configure(c Config) error {
 	e.life.Lock()
@@ -122,6 +133,7 @@ func (e *Engine) Configure(c Config) error {
 		}
 	}
 	e.stopLocked()
+	e.holidays.Configure(c.StateFile + ".holidays.json")
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if changed {
@@ -139,6 +151,9 @@ func (e *Engine) Configure(c Config) error {
 		e.stop = make(chan struct{})
 		e.done = make(chan struct{})
 		go e.loop(e.stop, e.done)
+		if c.SkipCNHolidays {
+			e.holidays.Refresh(c, e.now(), false)
+		}
 	}
 	return nil
 }
@@ -150,6 +165,7 @@ func (e *Engine) stopLocked() {
 	e.stop = nil
 	e.done = nil
 	e.mu.Unlock()
+	e.holidays.Stop()
 	if stop != nil {
 		close(stop)
 		<-done
@@ -170,7 +186,7 @@ func (e *Engine) loop(stop <-chan struct{}, done chan<- struct{}) {
 	}
 }
 func eligible(a Auth, c Config) bool {
-	return strings.EqualFold(a.Provider, "codex") && !a.Disabled && a.ID != "" && c.Selects(a.ID)
+	return strings.EqualFold(a.Provider, "codex") && !a.Disabled && a.ID != "" && a.IsPlus() && c.Selects(a.ID)
 }
 func (e *Engine) pendingLocked(id string) *Slot {
 	for _, s := range e.slots {
@@ -192,9 +208,13 @@ func (e *Engine) Tick(now time.Time) {
 	defer e.tickMu.Unlock()
 	e.mu.Lock()
 	active := e.active
+	calendarConfig := e.cfg.Clone()
 	e.mu.Unlock()
 	if !active {
 		return
+	}
+	if calendarConfig.SkipCNHolidays {
+		e.holidays.Refresh(calendarConfig, now, false)
 	}
 	auths, err := e.host.ListAuths()
 	e.mu.Lock()
@@ -210,8 +230,10 @@ func (e *Engine) Tick(now time.Time) {
 	e.auths = auths
 	c := e.cfg
 	byID := map[string]Auth{}
+	plans := map[string]string{}
 	dirty := false
 	for _, a := range auths {
+		plans[a.ID] = a.PlanType
 		if eligible(a, c) {
 			byID[a.ID] = a
 		}
@@ -219,11 +241,16 @@ func (e *Engine) Tick(now time.Time) {
 	for _, s := range e.slots {
 		if !s.Complete() && !e.running[s.AuthID] {
 			if _, ok := byID[s.AuthID]; !ok {
-				s.Status = "cancelled"
-				s.LastError = "credential_removed_disabled_or_unselected"
-				s.CompletedAt = now
+				reason := "credential_removed_disabled_or_unselected"
+				if plan, exists := plans[s.AuthID]; exists && !(Auth{PlanType: plan}).IsPlus() {
+					reason = "plan_not_plus"
+				}
+				e.finishLocked(s, "cancelled", reason, now)
 				dirty = true
 				e.logLocked("task_cancelled", s, now)
+			} else if reason := e.scheduledBlockReason(s, now); reason != "" {
+				e.skipLocked(s, reason, now)
+				dirty = true
 			}
 		}
 	}
@@ -253,7 +280,10 @@ func (e *Engine) Tick(now time.Time) {
 				e.seen[key] = stamp
 				dirty = true
 				if e.pendingLocked(id) == nil {
-					e.newLocked(id, "scheduled", due)
+					s := e.newLocked(id, "scheduled", due)
+					if reason := e.scheduledBlockReason(s, now); reason != "" {
+						e.skipLocked(s, reason, now)
+					}
 				}
 			}
 		}
@@ -288,8 +318,12 @@ func (e *Engine) Manual(id string, now time.Time) ([]string, error) {
 	selected := []Auth{}
 	for _, a := range auths {
 		if eligible(a, e.cfg) && (id == "" || a.ID == id) {
-			if e.pendingLocked(a.ID) != nil {
-				return nil, ErrConflict
+			if pending := e.pendingLocked(a.ID); pending != nil {
+				if reason := e.scheduledBlockReason(pending, now); reason != "" && !e.running[a.ID] {
+					e.skipLocked(pending, reason, now)
+				} else {
+					return nil, ErrConflict
+				}
 			}
 			selected = append(selected, a)
 		}
@@ -343,6 +377,21 @@ func (e *Engine) finishLocked(s *Slot, status, reason string, now time.Time) {
 	s.CompletedAt = now
 	s.NextAttempt = time.Time{}
 }
+
+func (e *Engine) scheduledBlockReason(s *Slot, now time.Time) string {
+	if s.Source != "scheduled" {
+		return ""
+	}
+	if reason := DateBlockReason(e.cfg, s.Due, e.holidays); reason != "" {
+		return reason
+	}
+	return DateBlockReason(e.cfg, now, e.holidays)
+}
+
+func (e *Engine) skipLocked(s *Slot, reason string, now time.Time) {
+	e.finishLocked(s, "skipped", reason, now)
+	e.logLocked("task_skipped", s, now)
+}
 func (e *Engine) attempt(a Auth, key string, c Config) {
 	defer e.workers.Done()
 	result, err := e.host.Execute(a, c)
@@ -390,6 +439,16 @@ func (e *Engine) attempt(a Auth, key string, c Config) {
 			}
 		}
 	}
+	if s.Source == "scheduled" && (!s.Complete() || s.Status == "failed") {
+		reason := e.scheduledBlockReason(s, now)
+		if reason == "" && !s.NextAttempt.IsZero() {
+			reason = DateBlockReason(e.cfg, s.NextAttempt, e.holidays)
+		}
+		if reason != "" {
+			e.finishLocked(s, "skipped", reason, now)
+			notify = false
+		}
+	}
 	e.logLocked(s.Status, s, now)
 	_ = e.saveLocked()
 	delete(e.running, a.ID)
@@ -410,7 +469,8 @@ func (e *Engine) logLocked(event string, s *Slot, now time.Time) {
 func (e *Engine) Status(now time.Time) Status {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	out := Status{Enabled: e.active, Config: e.cfg.Clone(), Now: now, Auths: append([]Auth{}, e.auths...), Slots: []Slot{}, Schedules: NextRuns(e.cfg, now), StateError: e.stateError, AuthError: e.authError}
+	out := Status{Enabled: e.active, Config: e.cfg.Clone(), Now: now, Auths: append([]Auth{}, e.auths...), Slots: []Slot{}, Schedules: NextRuns(e.cfg, now, e.holidays), StateError: e.stateError, AuthError: e.authError,
+		EffectiveRule: e.cfg.OneTimeRule.Effective(now, e.cfg.Timezone), HolidayStatus: e.holidays.Calendar(e.cfg, now)}
 	for _, s := range e.slots {
 		out.Slots = append(out.Slots, *s)
 	}
@@ -422,6 +482,32 @@ func (e *Engine) Logs() []LogEntry {
 	defer e.mu.Unlock()
 	return append([]LogEntry{}, e.logs...)
 }
+
+func (e *Engine) HolidayCalendar(now time.Time, refresh bool, timezone ...string) HolidayCalendar {
+	e.mu.Lock()
+	c := e.cfg.Clone()
+	e.mu.Unlock()
+	if len(timezone) > 0 && timezone[0] != "" {
+		c.Timezone = timezone[0]
+	}
+	e.holidays.Refresh(c, now, refresh)
+	return e.holidays.Calendar(c, now)
+}
+
+func (e *Engine) ImportHolidays(raw []byte, preview bool, now time.Time) (HolidayYearStatus, error) {
+	data, err := ParseHolidayData(raw, 0)
+	if err != nil {
+		return HolidayYearStatus{}, err
+	}
+	if !preview {
+		if err := e.holidays.Import(data, now); err != nil {
+			return HolidayYearStatus{}, err
+		}
+	}
+	return HolidaySummary(data), nil
+}
+
+func (e *Engine) ClearImportedHolidays(year int) error { return e.holidays.ClearImport(year) }
 func (e *Engine) saveLocked() error {
 	state := diskState{Schema: 2, Seen: e.seen, Logs: e.logs, Slots: []*Slot{}}
 	cutoff := e.now().Add(-7 * 24 * time.Hour)
