@@ -29,6 +29,7 @@ class Plugin(C.Structure):
 held, errors = {}, []
 used = {"a": None, "b": 30, "c": 32}
 weekly = {"a": 4, "b": 4, "c": 4}
+quota_failures = set()
 queries = 0
 
 
@@ -51,7 +52,8 @@ def host_call(ctx, method, data, length, output):
                 windows["secondary_window"] = {"limit_window_seconds": 18000,
                     "used_percent": used[key], "reset_at": int(time.time()) + 18000}
             body = {"rate_limit": windows}
-            result = {"StatusCode": 200, "Body": base64.b64encode(json.dumps(body).encode()).decode()}
+            result = {"StatusCode": 503 if key in quota_failures else 200,
+                      "Body": base64.b64encode(json.dumps(body).encode()).decode()}
             queries += 1
         elif method == "host.log":
             result = {}
@@ -101,7 +103,8 @@ def pick(session, key="general", candidates=("a", "b", "c"), metadata=None):
 with tempfile.TemporaryDirectory() as tmp:
     config = {"enabled": False, "state_file": str(pathlib.Path(tmp) / "wake.json"),
               "quota_routing": {"enabled": True, "quota_cache_ttl": "1s",
-                                "bindings": [{"key": "dedicated", "allow": ["a"]}]}}
+                                "bindings": [{"key": "dedicated", "allow": ["a"]},
+                                             {"key": "failover-key", "allow": ["b"], "fallback_allow": ["a", "c"]}]}}
     payload = {"config_yaml": base64.b64encode(json.dumps(config).encode()).decode()}
     caps = invoke("plugin.register", payload)["result"]["capabilities"]
     assert caps["scheduler"] and caps["scheduler_across_priorities"]
@@ -125,12 +128,25 @@ with tempfile.TemporaryDirectory() as tmp:
     denied = pick("fixed", key="dedicated", candidates=("b",))
     assert not denied["ok"] and denied["error"]["code"] == "bound_auth_unavailable", denied
     assert pick("wake", metadata={"pinned_auth_id": "b"})["result"]["AuthID"] == "b"
+    assert pick("ongoing", key="failover-key")["result"]["AuthID"] == "b"
+    used["b"] = 100
+    time.sleep(1.05)
+    assert pick("ongoing", key="failover-key")["result"]["AuthID"] == "c", "exhausted primary did not fail over"
+    quota_failures.add("b")
+    time.sleep(1.05)
+    assert pick("new-before-recovery", key="failover-key")["result"]["AuthID"] == "c", "failed refresh cleared exhaustion"
+    quota_failures.clear()
+    used["b"] = 0
+    time.sleep(1.05)
+    assert pick("ongoing", key="failover-key")["result"]["AuthID"] == "c", "primary recovery bounced an active backup session"
+    assert pick("new-after-recovery", key="failover-key")["result"]["AuthID"] == "b"
     state = pathlib.Path(config["state_file"] + ".routing.json").read_text()
-    assert "fake-secret" not in state and "dedicated" not in state and "general" not in state
+    assert "fake-secret" not in state and "dedicated" not in state and "general" not in state and "failover-key" not in state
     invoke("plugin.reconfigure", payload)
     assert pick("first")["result"]["AuthID"] == "b"
+    assert pick("ongoing", key="failover-key")["result"]["AuthID"] == "c"
     plugin.stop()
 
 assert not errors, errors
 assert not held, "host callback buffers leaked"
-print("Routing ABI: weekly-only Business quota, dual-window balancing, active-session rebalance, nearby-quota rotation, cache refresh, key isolation, pinning, persistence and reconfigure passed")
+print("Routing ABI: dual-window balancing, exhausted-session fallback, failed-refresh protection, stable backup bindings, key isolation, pinning, persistence and reconfigure passed")

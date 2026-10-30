@@ -294,6 +294,133 @@ func TestExhaustedPriorityTierFallsBackAndBoundSessionMoves(t *testing.T) {
 	picked(t, r, req, "b.json")
 }
 
+func TestBoundSessionFailsOverToExplicitBackupAndKeepsItAfterRecovery(t *testing.T) {
+	h := fixture()
+	h.used["b.json"] = 0
+	r := configured(t, h, "  bindings:\n    - key: client-key\n      allow: [a.*]\n      fallback_allow: [b.*]\n")
+	req := request("ongoing")
+	req.Candidates[1].Priority = 9
+	picked(t, r, req, "a.json")
+	h.used["a.json"] = 100
+	h.now = h.now.Add(time.Minute)
+	picked(t, r, req, "b.json")
+	// A restart must recover the replacement binding, not the exhausted one.
+	restarted := New(h)
+	restarted.now = r.now
+	plan, err := restarted.Prepare(r.config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted.Configure(plan)
+	picked(t, restarted, req, "b.json")
+	h.used["a.json"] = 0
+	h.now = h.now.Add(time.Minute)
+	picked(t, restarted, req, "b.json")
+	newSession := request("new-after-recovery")
+	newSession.Candidates = req.Candidates
+	picked(t, restarted, newSession, "a.json")
+}
+
+func TestBackupsCoverUnavailablePrimariesButDoNotEscapeTheirAllowList(t *testing.T) {
+	h, candidates := mixedPlanPool()
+	r := configured(t, h, "  bindings:\n    - key: client-key\n      allow: [b-plus.json]\n      fallback_allow: [c-plus.json]\n")
+	req := request("ongoing")
+	req.Candidates = candidates
+	picked(t, r, req, "b-plus.json")
+	// The unrelated Business account has more quota and priority, but is not
+	// authorized for this key. The host removed the unavailable primary.
+	req.Candidates = []Candidate{candidates[0], candidates[2]}
+	req.Candidates[0].Priority = 99
+	picked(t, r, req, "c-plus.json")
+	req.Candidates = req.Candidates[:1]
+	if got := r.Pick(req); !got.Reject || got.RejectCode != "bound_auth_unavailable" {
+		t.Fatalf("fallback escaped its explicit pool: %+v", got)
+	}
+}
+
+func TestWeeklyExhaustionUsesBackupAndBothExhaustedReject(t *testing.T) {
+	h := fixture()
+	h.weeklyOnly = map[string]bool{"a.json": true}
+	h.weeklyUsed = map[string]float64{"a.json": 99, "b.json": 2}
+	r := configured(t, h, "  bindings:\n    - key: client-key\n      allow: [a.json]\n      fallback_allow: [b.json]\n")
+	picked(t, r, request("old-weekly-session"), "a.json")
+	h.weeklyUsed["a.json"] = 100
+	h.now = h.now.Add(time.Minute)
+	picked(t, r, request("old-weekly-session"), "b.json")
+	h.weeklyUsed["b.json"] = 100
+	h.now = h.now.Add(time.Minute)
+	if got := r.Pick(request("old-weekly-session")); !got.Reject || got.RejectCode != "quota_exhausted" {
+		t.Fatalf("fully exhausted backup pool accepted: %+v", got)
+	}
+}
+
+func TestFailedRefreshPreservesExhaustionUntilReset(t *testing.T) {
+	for _, weekly := range []bool{false, true} {
+		t.Run(fmt.Sprint("weekly=", weekly), func(t *testing.T) {
+			h := fixture()
+			r := configured(t, h, "")
+			picked(t, r, request("ongoing"), "a.json")
+			reset := h.now.Add(5 * time.Hour)
+			q := r.quotas["a.json"]
+			if weekly {
+				q.Known = false
+				q.Weekly = &keeper.QuotaWindow{UsedPercent: 100, ResetAt: reset}
+			} else {
+				q.UsedPercent, q.ResetAt = 100, reset
+			}
+			r.quotas["a.json"] = q
+			h.failIDs = map[string]bool{"a.json": true}
+			h.now = h.now.Add(time.Minute)
+			picked(t, r, request("ongoing"), "b.json")
+			h.now = h.now.Add(time.Minute)
+			picked(t, r, request("new-before-reset"), "b.json")
+			if r.quotaAvailable("a.json", h.now) || r.quotas["a.json"].Error == "" {
+				t.Fatal("failed quota lookup resurrected confirmed exhaustion")
+			}
+			h.now = reset.Add(time.Second)
+			picked(t, r, request("new-after-reset"), "a.json")
+		})
+	}
+}
+
+func TestExhaustedBackupBindingIsNotAcceptedWhenStateWriteFails(t *testing.T) {
+	h := fixture()
+	r := configured(t, h, "  bindings:\n    - key: client-key\n      allow: [a.json]\n      fallback_allow: [b.json]\n")
+	picked(t, r, request("ongoing"), "a.json")
+	scope := digest("client-key\x00codex\x00gpt-6.1-sol")
+	key := digest(scope + "\x00ongoing")
+	h.used["a.json"] = 100
+	h.now = h.now.Add(time.Minute)
+	r.config.StateFile = t.TempDir()
+	if got := r.Pick(request("ongoing")); !got.Reject || got.RejectCode != "routing_state_write_failed" || r.bindings[key].AuthID != "a.json" {
+		t.Fatalf("unpersisted fallback binding accepted: %+v", got)
+	}
+}
+
+func TestPartialRefreshDoesNotDiscardExhaustedWindow(t *testing.T) {
+	for _, weekly := range []bool{false, true} {
+		t.Run(fmt.Sprint("weekly=", weekly), func(t *testing.T) {
+			h := fixture()
+			r := configured(t, h, "")
+			picked(t, r, request("ongoing"), "a.json")
+			q := r.quotas["a.json"]
+			if weekly {
+				q.Weekly = &keeper.QuotaWindow{UsedPercent: 100, ResetAt: h.now.Add(7 * 24 * time.Hour)}
+			} else {
+				q.UsedPercent = 100
+				h.weeklyOnly = map[string]bool{"a.json": true}
+				h.weeklyUsed = map[string]float64{"a.json": 20}
+			}
+			r.quotas["a.json"] = q
+			h.now = h.now.Add(time.Minute)
+			picked(t, r, request("ongoing"), "b.json")
+			if r.quotaAvailable("a.json", h.now) {
+				t.Fatal("partial observation cleared a missing exhausted window")
+			}
+		})
+	}
+}
+
 func TestRoundRobinCursorSurvivesRestart(t *testing.T) {
 	h, candidates := mixedPlanPool()
 	r := configured(t, h, "")
@@ -548,6 +675,8 @@ func TestConfigurationValidation(t *testing.T) {
 		"quota_routing: {bindings: [{key: secret-token, allow: ['[']}]}",
 		"quota_routing: {bindings: [{key: secret-token, allow: []}]}",
 		"quota_routing: {bindings: [{key: a, allow: ['*']}, {key: a, allow: ['*']}]}",
+		"quota_routing: {bindings: [{key: secret-token, allow: ['*'], fallback_allow: ['[']}]}",
+		"quota_routing: {bindings: [{key: a, allow: ['*'], fallback_allow: [' ']}]}",
 	} {
 		_, err := Parse([]byte(raw), "state.json")
 		if err == nil || strings.Contains(err.Error(), "secret-token") {
@@ -557,6 +686,10 @@ func TestConfigurationValidation(t *testing.T) {
 	c, err := Parse(nil, "state.json")
 	if err != nil || c.Enabled || c.SessionTTL != "4h" || c.QuotaCacheTTL != "1m" {
 		t.Fatalf("defaults: %+v %v", c, err)
+	}
+	c, err = Parse([]byte("quota_routing: {bindings: [{key: a, allow: [' A.* '], fallback_allow: [' B.* ']}]}"), "state.json")
+	if err != nil || c.Bindings[0].Allow[0] != "a.*" || c.Bindings[0].FallbackAllow[0] != "b.*" {
+		t.Fatalf("fallback patterns were not normalized: %+v %v", c, err)
 	}
 }
 
@@ -595,6 +728,36 @@ func TestSlowQuotaLookupDoesNotBlockExistingSession(t *testing.T) {
 	}
 	close(blocked.release)
 	if got := <-done; got.AuthID != "b.json" {
+		t.Fatal(got)
+	}
+}
+
+func TestConcurrentRefreshDoesNotReuseStaleExhaustedBinding(t *testing.T) {
+	h := fixture()
+	r := configured(t, h, "")
+	picked(t, r, request("existing"), "a.json")
+	h.used["a.json"] = 100
+	q := r.quotas["a.json"]
+	q.UsedPercent = 100
+	r.quotas["a.json"] = q
+	h.now = h.now.Add(2 * time.Minute)
+	blocked := &blockingHost{fakeHost: h, started: make(chan struct{}), release: make(chan struct{})}
+	r.host = blocked
+	done := make(chan Response, 1)
+	go func() { done <- r.Pick(request("new")) }()
+	<-blocked.started
+	sticky := make(chan Response, 1)
+	go func() { sticky <- r.Pick(request("existing")) }()
+	select {
+	case got := <-sticky:
+		if got.AuthID != "b.json" || got.Reject {
+			t.Errorf("stale exhausted binding was reused: %+v", got)
+		}
+	case <-time.After(time.Second):
+		t.Error("exhaustion failover waited for unrelated quota refresh")
+	}
+	close(blocked.release)
+	if got := <-done; got.AuthID != "b.json" || got.Reject {
 		t.Fatal(got)
 	}
 }

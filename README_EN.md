@@ -107,7 +107,7 @@ For example, these three accounts have the same priority. All percentages below 
 
 Both Plus accounts pass the weekly filter because their headroom differs by two points. Their five-hour headroom differs by eighteen points, so Plus A is preferred. Reevaluate as quotas change; rotate when both differences fall within five points. The aim is gradual quota balancing, without requiring equal request counts.
 
-Windows are identified by actual duration: **18000 seconds** for five hours and **604800 seconds** for a week. `primary_window` is not assumed to mean five hours. A Business Premium credential exposing only weekly quota still participates. Missing windows, stale observations, and failed queries remain unknown candidates, rather than being assigned zero usage or excluded for lacking a five-hour window.
+Windows are identified by actual duration: **18000 seconds** for five hours and **604800 seconds** for a week. `primary_window` is not assumed to mean five hours. A Business Premium credential exposing only weekly quota still participates. Missing windows, stale observations, and failed queries remain unknown candidates, rather than being assigned zero usage or excluded for lacking a five-hour window. Confirmed exhaustion is an exception: an expired cache, concurrent refresh, failed query, or response omitting that window does not clear it until its reset time or a successful observation confirms recovery.
 
 ### When established sessions move
 
@@ -118,6 +118,8 @@ Keep the existing credential while quotas are close. Rebind on the next request 
 - The credential remains in that weekly cohort, but its five-hour usage exceeds the cohort's minimum by **more than twenty percentage points**.
 
 The wider rebinding thresholds reduce frequent switches caused by small changes. **The 5/10/20-point thresholds are constants in the current implementation, not YAML options.** Credentials never change in the middle of an executing request; one long request still consumes one account.
+
+For a downstream key restricted to one account, explicitly configure `fallback_allow` on its binding to continue the same session when the primary is exhausted or unavailable. Healthy primaries take precedence over backups. A successful failover persists the replacement binding; primary recovery does not immediately move that session back, while new sessions prefer the primary again. Backup accounts must still appear among CPA's available candidates for the requested model.
 
 Explicit host `pinned_auth_id` requests, including wake requests, take precedence. Routing is independent of wake `auth_ids`: the Plus-only wake restriction does not exclude Business Premium from normal request routing. Unbound non-Codex or mixed-provider requests retain native CPA scheduling; explicit downstream key bindings still restrict their credential pool. Codex requests without stable session identity use the same quota rules per request without creating bindings.
 
@@ -139,10 +141,10 @@ quota_routing:
 | `session_ttl` | `4h` | Inactivity lifetime for session bindings; `1m` to `168h` |
 | `quota_cache_ttl` | `1m` | Quota cache lifetime; `1s` to `5m` |
 | `state_file` | Wake `state_file` plus `.routing.json` | Writable path for persisted bindings and rotation cursors |
-| `bindings` | `[]` | Optional downstream keys and allowed credential pools |
+| `bindings` | `[]` | Optional downstream keys and primary/backup pools; `allow` is required, `fallback_allow` is optional |
 | `unbound` | `passthrough` | Unbound keys use quota routing; `deny` rejects them |
 
-Established sessions also refresh expired quota caches. While another request is already refreshing, they use cached observations and consider the new data on a subsequent request. An expired known window also triggers a refresh. Bindings and rotation cursors survive restarts, support older binding files, and contain no raw downstream keys or session IDs.
+Established sessions also refresh expired quota caches. While another request is already refreshing, they use cached observations and consider the new data on a subsequent request, while still excluding confirmed exhausted windows that have not reset. An expired known window also triggers a refresh. Bindings and rotation cursors survive restarts, support older binding files, and contain no raw downstream keys or session IDs.
 
 The management `/status` response exposes `quota_routing.strategy: weekly-then-five-hour`, cached quota, active binding count, and persistence errors. In quota objects, `known`, `used_percent`, and `reset_at` describe the five-hour window; `weekly` describes the weekly window. A weekly-only account can have `known: false` with valid weekly data. The page converts used percentages to remaining percentages.
 
@@ -156,12 +158,14 @@ quota_routing:
   bindings:
     - key: "downstream-dedicated-key-a"
       allow: ["codex-account-a.json"]
+      fallback_allow: ["codex-account-b.json", "codex-account-c.json"]
     - key: "downstream-dedicated-key-b"
       allow: ["codex-account-b.json"]
+      fallback_allow: ["codex-account-a.json", "codex-account-c.json"]
   unbound: passthrough
 ```
 
-Credential globs are case-insensitive; keys remain case-sensitive. A bound key fails closed when no allowed credential is available. Unbound keys use quota routing by default; `unbound: deny` rejects them instead. Bound keys must authenticate using a Bearer/API-Key header; internal pinned wake requests are exempt.
+Both `allow` and `fallback_allow` accept case-insensitive credential globs; keys remain case-sensitive. New selections use the explicitly authorized backup pool only when every primary is exhausted or unavailable, applying the same quota and priority rules. Selection never escapes those two lists. Omitting backups preserves strict isolation and fails closed when no primary is available; an exhausted primary and backup pool returns `quota_exhausted`. Unbound keys use quota routing by default; `unbound: deny` rejects them instead. Bound keys must authenticate using a Bearer/API-Key header; internal pinned wake requests are exempt.
 
 Supported identity headers include `Session_id`, `Session-Id`, `X-Codex-Thread-Id`, `X-Session-ID`, and `X-Conversation-ID`, with CPA session metadata as fallback. Bindings are isolated by downstream key, provider, model, and session. State never contains raw keys or session IDs. On first enable, CPA's previous in-memory bindings cannot be read: finish old tasks before switching, or migrate known bindings beforehand. Invalid state prevents routing activation; failed persistence rejects new bindings while existing bindings can continue in memory and expose a status error. Quota observations guide gradual balancing, without guaranteeing equal request counts or usage percentages at every instant. A single long request still consumes one account. Upgrades restore existing bindings and apply rebinding thresholds on subsequent requests.
 

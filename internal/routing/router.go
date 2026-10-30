@@ -186,7 +186,7 @@ func (r *Router) Pick(req Request) Response {
 	pool := make([]Candidate, 0, len(req.Candidates))
 	allCodex := true
 	for _, c := range req.Candidates {
-		if c.ID == "" || !usable(c.Status) || (rule != nil && !matches(rule.Allow, c.ID)) {
+		if c.ID == "" || !usable(c.Status) || (rule != nil && !matches(rule.Allow, c.ID) && !matches(rule.FallbackAllow, c.ID)) {
 			continue
 		}
 		pool = append(pool, c)
@@ -235,11 +235,6 @@ func (r *Router) Pick(req Request) Response {
 			r.mu.Lock()
 			return decision
 		}
-		if identity != "" {
-			if id := r.reuse(bindingKey, pool, now); id != "" {
-				return Response{Handled: true, AuthID: id}
-			}
-		}
 		eligible := pool[:0]
 		for _, c := range pool {
 			if r.quotaAvailable(c.ID, now) {
@@ -250,10 +245,38 @@ func (r *Router) Pick(req Request) Response {
 			return reject("quota_exhausted")
 		}
 		pool = eligible
-	} else if identity != "" {
-		if id := r.reuse(bindingKey, pool, now); id != "" {
+	}
+	// Backups are an explicitly authorized pool, not ordinary peers of healthy
+	// primary accounts. A session already moved to a backup keeps that pool so a
+	// primary recovery does not immediately bounce it back to the old account.
+	primary, fallback := pool, []Candidate(nil)
+	if rule != nil {
+		primary = make([]Candidate, 0, len(pool))
+		for _, c := range pool {
+			if matches(rule.Allow, c.ID) {
+				primary = append(primary, c)
+			} else {
+				fallback = append(fallback, c)
+			}
+		}
+	}
+	if identity != "" {
+		stickyPool := primary
+		for _, c := range fallback {
+			if c.ID == r.bindings[bindingKey].AuthID {
+				stickyPool = fallback
+				break
+			}
+		}
+		if id := r.reuse(bindingKey, stickyPool, now); id != "" {
 			return Response{Handled: true, AuthID: id}
 		}
+	}
+	pool = primary
+	selectionReason := "weekly_then_five_hour_balance"
+	if len(pool) == 0 {
+		pool = fallback
+		selectionReason = "bound_pool_fallback"
 	}
 	// Honor credential priorities after excluding exhausted quota, so lower tiers
 	// can take over. Balance weekly consumption first, then short-term headroom;
@@ -309,17 +332,14 @@ func (r *Router) Pick(req Request) Response {
 			return reject("routing_state_write_failed")
 		}
 	}
-	r.host.Log("info", "quota_routing_new_binding", map[string]any{"credential": picked, "model": req.Model, "reason": "weekly_then_five_hour_balance"})
+	r.host.Log("info", "quota_routing_new_binding", map[string]any{"credential": picked, "model": req.Model, "reason": selectionReason})
 	return Response{Handled: true, AuthID: picked}
 }
 
-// Unknown, stale and reset observations must not permanently exclude an account.
-// Only a fresh, confirmed exhausted window makes an otherwise usable auth ineligible.
+// A confirmed exhausted window stays blocked until its reset, even if its cache
+// TTL expires or a refresh is in progress. Unknown and reset windows remain usable.
 func (r *Router) quotaAvailable(id string, now time.Time) bool {
 	q := r.quotas[id]
-	if now.Sub(q.ObservedAt) >= r.config.quotaTTL {
-		return true
-	}
 	return !(q.Known && now.Before(q.ResetAt) && q.UsedPercent >= 100) &&
 		!(q.Weekly != nil && now.Before(q.Weekly.ResetAt) && q.Weekly.UsedPercent >= 100)
 }
@@ -405,6 +425,16 @@ func (r *Router) refresh(pool []Candidate, now time.Time, wait bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for id, q := range fetchedQuotas {
+		// A failed or partial lookup does not establish recovery for a missing
+		// window. Keep only prior confirmed exhaustion until reset; successful
+		// observations of that window can establish earlier recovery.
+		previous := r.quotas[id]
+		if !q.Known && previous.Known && previous.UsedPercent >= 100 && now.Before(previous.ResetAt) {
+			q.Known, q.UsedPercent, q.ResetAt = true, previous.UsedPercent, previous.ResetAt
+		}
+		if q.Weekly == nil && previous.Weekly != nil && previous.Weekly.UsedPercent >= 100 && now.Before(previous.Weekly.ResetAt) {
+			q.Weekly = previous.Weekly
+		}
 		r.quotas[id], r.queried[id] = q, now
 	}
 	if len(r.quotas) > 4096 {

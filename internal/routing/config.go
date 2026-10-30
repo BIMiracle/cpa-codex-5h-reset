@@ -11,8 +11,9 @@ import (
 )
 
 type Binding struct {
-	Key   string   `yaml:"key"`
-	Allow []string `yaml:"allow"`
+	Key           string   `yaml:"key"`
+	Allow         []string `yaml:"allow"`
+	FallbackAllow []string `yaml:"fallback_allow,omitempty"`
 }
 
 type Config struct {
@@ -63,12 +64,17 @@ func Parse(raw []byte, wakeStateFile string) (Config, error) {
 			return Config{}, fmt.Errorf("quota_routing.bindings[%d]: unique key and allow patterns required", i)
 		}
 		keys[b.Key] = true
-		for j, pattern := range b.Allow {
-			pattern = strings.ToLower(strings.TrimSpace(pattern))
-			if _, err := path.Match(pattern, "auth.json"); err != nil || pattern == "" {
-				return Config{}, fmt.Errorf("quota_routing.bindings[%d]: invalid allow pattern", i)
+		for _, patterns := range []struct {
+			name   string
+			values []string
+		}{{"allow", b.Allow}, {"fallback_allow", b.FallbackAllow}} {
+			for j, pattern := range patterns.values {
+				pattern = strings.ToLower(strings.TrimSpace(pattern))
+				if _, err := path.Match(pattern, "auth.json"); err != nil || pattern == "" {
+					return Config{}, fmt.Errorf("quota_routing.bindings[%d]: invalid %s pattern", i, patterns.name)
+				}
+				patterns.values[j] = pattern
 			}
-			b.Allow[j] = pattern
 		}
 	}
 	return c, nil
