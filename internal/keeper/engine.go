@@ -399,7 +399,7 @@ func (e *Engine) attempt(a Auth, key string, c Config) {
 	success := err == nil && result.StatusCode >= 200 && result.StatusCode < 300
 	// Query quota after every attempt, including failures; never rely on a stale window.
 	q, qerr := e.host.FetchQuota(a, now)
-	if qerr != nil {
+	if qerr != nil && q.Error == "" {
 		q = Quota{ObservedAt: now, Error: "quota_unavailable"}
 	}
 	reset, hasReset := q.ResetAt, q.Known

@@ -297,6 +297,16 @@ test("only Plus accounts can be selected or woken", async () => {
   assert.equal(JSON.parse(runs[0].options.body).auth_id, "plus");
 });
 
+test("invalid Business OAuth shows reauthentication instead of a wake status", async () => {
+  const x = setup({ quotaAuths: [{ id: "business", provider: "codex", plan_type: "self_serve_business_prolite" }],
+    quotas: { business: { error: "credential_reauth_required", observed_at: "2026-10-30T10:00:00Z" } } });
+  await settle();
+  const row = x.$("accounts").children[0];
+  assert.equal(row.children[1].textContent, "Business Premium");
+  assert.match(row.children[6].textContent, /重新登录/);
+  assert.equal(x.sent.filter(s => s.url.endsWith("/run")).length, 0);
+});
+
 test("wake-all is disabled without an eligible selected Plus account", async () => {
   for (const options of [
     { quotaAuths: [{ id: "premium", provider: "codex", plan_type: "Business Premium" }] },

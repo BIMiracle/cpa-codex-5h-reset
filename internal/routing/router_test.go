@@ -321,6 +321,39 @@ func TestBoundSessionFailsOverToExplicitBackupAndKeepsItAfterRecovery(t *testing
 	picked(t, restarted, newSession, "a.json")
 }
 
+func TestHistoricalHostErrorDoesNotPreventSameSessionFailover(t *testing.T) {
+	h, candidates := mixedPlanPool()
+	h.weeklyOnly = map[string]bool{"a-business.json": true}
+	h.weeklyUsed = map[string]float64{"a-business.json": 12, "b-plus.json": 43, "c-plus.json": 62}
+	h.used["b-plus.json"], h.used["c-plus.json"] = 2, 3
+	r := configured(t, h, "  bindings:\n    - key: client-key\n      allow: [c-plus.json]\n      fallback_allow: [a-business.json, b-plus.json]\n")
+	req := request("existing-cli-session")
+	req.Candidates = candidates
+	picked(t, r, req, "c-plus.json")
+
+	// CPA has already checked per-model cooldowns before supplying candidates.
+	// A previous TLS/HTTP2 failure can leave the aggregate status as "error"
+	// even after that cooldown has expired or for an unrelated model failure.
+	req.Candidates[0].Status = "error"
+	req.Candidates[1].Status = "error"
+	h.used["c-plus.json"] = 100
+	h.now = h.now.Add(time.Minute)
+	picked(t, r, req, "a-business.json")
+	if h.calls != 6 {
+		t.Fatalf("recovered backups were not queried: %d quota calls", h.calls)
+	}
+
+	// If the host omits Business while it is genuinely cooling down, only the
+	// other explicitly authorized Plus backup may take over.
+	req.Candidates = req.Candidates[1:]
+	picked(t, r, req, "b-plus.json")
+	h.used["b-plus.json"] = 100
+	h.now = h.now.Add(time.Minute)
+	if got := r.Pick(req); !got.Reject || got.RejectCode != "quota_exhausted" {
+		t.Fatalf("genuinely exhausted remaining pool accepted: %+v", got)
+	}
+}
+
 func TestBackupsCoverUnavailablePrimariesButDoNotEscapeTheirAllowList(t *testing.T) {
 	h, candidates := mixedPlanPool()
 	r := configured(t, h, "  bindings:\n    - key: client-key\n      allow: [b-plus.json]\n      fallback_allow: [c-plus.json]\n")

@@ -1,5 +1,7 @@
 # CPA Codex 5h Reset
 
+Quota queries can recover OAuth credentials through the optional CPA `host.auth.refresh` callback. They attempt renewal within five minutes of access-token expiry, or refresh once after a usage HTTP 401 and retry the read once. The host coordinates concurrent refreshes and saves rotated credentials. Older hosts can still query valid tokens; recovery requires a host with the new callback. Invalid, revoked, expired, or missing refresh tokens require signing in again. Credential renewal does not renew a subscription or reset usage limits.
+
 **Scheduled Codex wake-up requests · A native CLIProxyAPI (CPA) plugin**
 
 [中文](README.md) | English

@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
-	"time"
 )
 
 type host struct{}
@@ -60,42 +59,6 @@ func (host) Execute(a keeper.Auth, c keeper.Config) (keeper.Execution, error) {
 	var result keeper.Execution
 	err = json.Unmarshal(raw, &result)
 	return result, err
-}
-func (host) FetchQuota(a keeper.Auth, now time.Time) (keeper.Quota, error) {
-	unknown := keeper.Quota{ObservedAt: now, Error: "quota_unavailable"}
-	if a.AuthIndex == "" {
-		return unknown, errors.New("auth_index_missing")
-	}
-	raw, err := invokeHost("host.auth.get", map[string]any{"auth_index": a.AuthIndex})
-	if err != nil {
-		return unknown, errors.New("credential_unavailable")
-	}
-	var credential struct {
-		JSON struct {
-			AccessToken string `json:"access_token"`
-			AccountID   string `json:"account_id"`
-		} `json:"json"`
-	}
-	if json.Unmarshal(raw, &credential) != nil || credential.JSON.AccessToken == "" {
-		return unknown, errors.New("credential_unavailable")
-	}
-	headers := http.Header{"Authorization": {"Bearer " + credential.JSON.AccessToken}, "Accept": {"application/json"}, "User-Agent": {"cpa-codex-5h-reset"}}
-	if credential.JSON.AccountID != "" {
-		headers.Set("ChatGPT-Account-Id", credential.JSON.AccountID)
-	}
-	// Fixed official origin: credential secrets are never sent to a configurable URL.
-	raw, err = invokeHost("host.http.do", map[string]any{"Method": "GET", "URL": "https://chatgpt.com/backend-api/wham/usage", "Headers": headers})
-	if err != nil {
-		return unknown, errors.New("quota_request_failed")
-	}
-	var response struct {
-		StatusCode int
-		Body       []byte
-	}
-	if json.Unmarshal(raw, &response) != nil || response.StatusCode != 200 {
-		return unknown, errors.New("quota_request_failed")
-	}
-	return keeper.ParseQuota(response.Body, now)
 }
 func (host) Log(level, event string, fields map[string]any) {
 	fields["plugin_id"] = pluginID

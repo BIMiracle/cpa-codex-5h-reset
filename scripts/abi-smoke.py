@@ -20,10 +20,12 @@ class Plugin(C.Structure):
     _fields_ = [('version', C.c_uint32), ('call', PCALL), ('free', FREE), ('stop', STOP)]
 held = {}
 executions = 0
+business_refreshed = False
+credential_refreshes = 0
 errors = []
 @CALL
 def host_call(ctx, method, data, length, output):
-    global executions
+    global executions, business_refreshed, credential_refreshes
     try:
         method = method.decode()
         request = json.loads(C.string_at(data, length))
@@ -37,15 +39,26 @@ def host_call(ctx, method, data, length, output):
             executions += 1
             result = {'status_code': 500 if executions == 1 else 200}
         elif method == 'host.auth.get':
-            plan = 'business_premium' if request['auth_index'] == 'business-index' else 'plus'
+            business = request['auth_index'] == 'business-index'
+            plan = 'business_premium' if business else 'plus'
             claims = {'https://api.openai.com/auth': {'chatgpt_plan_type': plan}}
             token = 'header.' + base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip('=') + '.signature'
-            result = {'json': {'access_token': 'mock-secret', 'account_id': 'mock-account', 'id_token': token}}
+            access_token = ('business-fresh-secret' if business_refreshed else 'business-expired-secret') if business else 'mock-secret'
+            result = {'json': {'access_token': access_token, 'account_id': request['auth_index'], 'id_token': token}}
+        elif method == 'host.auth.refresh':
+            assert request['auth_index'] == 'business-index'
+            assert request['access_token'] == 'business-expired-secret'
+            credential_refreshes += 1
+            business_refreshed = True
+            result = {'json': {'access_token': 'business-fresh-secret', 'account_id': 'business-index'}}
         elif method == 'host.http.do':
             assert request['URL'] == 'https://chatgpt.com/backend-api/wham/usage'
-            quota = {'rate_limit': {'primary_window': {'limit_window_seconds': 18000,
+            bearer = request['Headers']['Authorization'][0]
+            business = bearer.startswith('Bearer business-')
+            quota = {'rate_limit': {'primary_window': {'limit_window_seconds': 604800 if business else 18000,
                 'reset_at': int(time.time()) + (2 if executions == 1 else 18000), 'used_percent': 0}}}
-            result = {'StatusCode': 200, 'Body': base64.b64encode(json.dumps(quota).encode()).decode()}
+            result = {'StatusCode': 401 if bearer == 'Bearer business-expired-secret' else 200,
+                      'Body': base64.b64encode(json.dumps(quota).encode()).decode()}
         elif method == 'host.log':
             result = {}
         else:
@@ -116,6 +129,12 @@ with tempfile.TemporaryDirectory() as tmp:
     assert all(day['data_known'] for day in display), 'month display lost imported annual data'
     assert management('POST', api + '/run', {'auth_id': 'business-account'})[0] == 400
     assert executions == 0, 'Business Premium must never execute a wake request'
+    code, quota_raw = management('GET', api + '/account-quotas')
+    quota_data = json.loads(quota_raw)
+    assert code == 200 and quota_data['quotas']['business-account']['weekly']
+    assert not quota_data['quotas']['business-account']['known']
+    assert credential_refreshes == 1 and executions == 0, 'usage recovery must refresh once without waking'
+    assert b'secret' not in quota_raw, 'quota response leaked a credential'
     assert management('POST', api + '/run', {})[0] == 202
     assert management('POST', api + '/run', {})[0] == 409
     deadline = time.time() + 12
@@ -140,4 +159,4 @@ with tempfile.TemporaryDirectory() as tmp:
     plugin.stop()
 assert not errors, errors
 assert not held, 'host buffers leaked'
-print('Native ABI: registration, resource, holiday preview/import/calendar persistence, Plus-only wake, bound execution, reset wait, retry, conflict, task persistence and shutdown passed')
+print('Native ABI: registration, resource, holiday persistence, OAuth 401 recovery, Plus-only wake, bound execution, reset wait, retry, conflict, persistence and shutdown passed')

@@ -416,7 +416,7 @@ func (r *Router) refresh(pool []Candidate, now time.Time, wait bool) {
 	for _, c := range needed {
 		q := keeper.Quota{ObservedAt: now, Error: "quota_unavailable"}
 		if a, ok := byID[c.ID]; ok {
-			if fetched, err := r.host.FetchQuota(a, now); err == nil {
+			if fetched, err := r.host.FetchQuota(a, now); err == nil || fetched.Error != "" {
 				q = fetched
 			}
 		}
@@ -595,8 +595,11 @@ func matches(patterns []string, id string) bool {
 
 func usable(status string) bool {
 	switch strings.ToLower(strings.TrimSpace(status)) {
-	case "disabled", "error", "expired", "revoked", "invalid", "unavailable", "cooldown", "quota_exhausted", "blocked":
+	case "disabled", "expired", "revoked", "invalid", "unavailable", "cooldown", "quota_exhausted", "blocked":
 		return false
 	}
+	// CPA checks availability for this request's model before supplying candidates.
+	// Its aggregate "error" can outlive a transient network failure or describe a
+	// different model. Rejecting it here prevents recovery and backup failover.
 	return true
 }

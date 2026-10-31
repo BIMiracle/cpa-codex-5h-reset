@@ -201,7 +201,9 @@ GitHub Actions 为五个平台运行 Go 测试、竞态检查、静态检查、�
 
 - **插件页面返回 404**：`/v0/resource/plugins/cpa-codex-5h-reset/ui` 是本插件声明的页面地址；只有当前 CPA 进程成功加载插件并注册资源后才可访问。先确认 `management.html` 可打开，再检查当前进程使用的配置文件、`plugins.enabled`、`plugins.dir` 与 `plugins.configs.cpa-codex-5h-reset.enabled`。启动日志应包含 `plugin loaded plugin_id=cpa-codex-5h-reset` 和 `plugin registered plugin_id=cpa-codex-5h-reset`；配置启用、磁盘存在 DLL 或旧日志曾加载成功，都不代表当前进程已加载。重新加载插件或重启 CPA 后再访问。若启动工作目录不确定，可显式使用 `cli-proxy-api.exe -config "C:/path/to/config.yaml"` 指定配置。页面 HTML/JS 本身无需 Management Key，因此页面的 404 不应通过修改密钥解决。
 - **插件未显示**：检查 CPA 插件总开关、目录层级、进程架构和动态库依赖；插件 ID 与文件名需匹配。
-- **额度未知**：检查凭据是否支持官方 Codex usage、网络与认证状态。缺少 `auth_index` 或凭据过期时降级为 30 秒有限重试，不虚构时间。
+- **额度未知**：检查凭据是否支持官方 Codex usage、网络与认证状态。支持 `host.auth.refresh` 的 CPA 会在 access token 到期前 5 分钟尝试刷新，或在 usage 返回 401 后刷新并重查一次；每次查询最多刷新一次，不发送模型请求。JWT 的 access token `exp` 优先于文件 `expired`，不使用 ID token 到期时间或文件建立时间。旧 CPA 不支持该回调时会提示升级或重新登录。刷新失败仍按原有有限重试处理，不虚构重置时间。
+- **OAuth 凭据需要重新登录**：`invalid_refresh_token`、`invalid_grant`、refresh token 过期/撤销/已被使用，或缺少 refresh token，都无法靠继续重试恢复。请在 CPA 为该账号重新完成 OAuth 登录。Plus 额度耗尽后，Business Premium 可以作为已配置的备用账号，但其认证和自身额度必须可用；自动刷新凭证不会续订套餐或重置额度。
+- **主号耗尽但备用号有额度，仍报 `quota_exhausted`**：检查已加载插件是否包含历史 `error` 状态恢复修复。CPA 的通用 `error` 会保留之前的 TLS/HTTP2 失败，并不代表该账号对当前模型仍不可用；冷却结束后，应允许 CPA 提供的候选参与备用切换。已有会话应在下一次请求更新绑定，无需重启客户端；当前模型的有效冷却、明确禁用及额度确实耗尽仍受限制。
 - **等待很久**：查看该账号真实重置时间；不会为了固定时点提前重置额度，也不再采用旧的三小时截止限制。
 - **无法保存状态**：检查运行 CPA 用户的目录写权限、磁盘空间。状态无法落盘时不继续发送新请求。
 - **401 / 通知未出现**：分别检查 Management Key、网页是否仍打开，以及浏览器和系统通知权限。

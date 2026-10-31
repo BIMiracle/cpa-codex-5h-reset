@@ -93,11 +93,11 @@ def invoke(method, payload):
     return result
 
 
-def pick(session, key="general", candidates=("a", "b", "c"), metadata=None):
+def pick(session, key="general", candidates=("a", "b", "c"), metadata=None, statuses=None):
     return invoke("scheduler.pick", {"Providers": ["codex"], "Model": "gpt-6.1-sol",
         "Options": {"Headers": {"Authorization": ["Bearer " + key], "Session_id": [session]},
                     "Metadata": metadata or {}},
-        "Candidates": [{"ID": k, "Provider": "codex"} for k in candidates]})
+        "Candidates": [{"ID": k, "Provider": "codex", "Status": (statuses or {}).get(k, "active")} for k in candidates]})
 
 
 with tempfile.TemporaryDirectory() as tmp:
@@ -140,13 +140,17 @@ with tempfile.TemporaryDirectory() as tmp:
     time.sleep(1.05)
     assert pick("ongoing", key="failover-key")["result"]["AuthID"] == "c", "primary recovery bounced an active backup session"
     assert pick("new-after-recovery", key="failover-key")["result"]["AuthID"] == "b"
+    used["b"] = 100
+    time.sleep(1.05)
+    recovered = pick("new-after-recovery", key="failover-key", statuses={"a": "error", "c": "error"})
+    assert recovered.get("result", {}).get("AuthID") == "c", "historical host errors blocked same-session failover: " + str(recovered)
     state = pathlib.Path(config["state_file"] + ".routing.json").read_text()
     assert "fake-secret" not in state and "dedicated" not in state and "general" not in state and "failover-key" not in state
     invoke("plugin.reconfigure", payload)
-    assert pick("first")["result"]["AuthID"] == "b"
+    assert pick("first")["result"]["AuthID"] == "c"
     assert pick("ongoing", key="failover-key")["result"]["AuthID"] == "c"
     plugin.stop()
 
 assert not errors, errors
 assert not held, "host callback buffers leaked"
-print("Routing ABI: dual-window balancing, exhausted-session fallback, failed-refresh protection, stable backup bindings, key isolation, pinning, persistence and reconfigure passed")
+print("Routing ABI: dual-window balancing, exhausted-session fallback, recovered-host-error failover, failed-refresh protection, stable backup bindings, key isolation, pinning, persistence and reconfigure passed")

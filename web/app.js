@@ -346,7 +346,7 @@ function managementSession() {
   function planLabel(a) {
     const plan = (a.plan_type || "").trim().toLowerCase();
     return { plus: "Plus", business_premium: "Business Premium", "business premium": "Business Premium",
-      "business-premium": "Business Premium", business: "Business", team: "Team", pro: "Pro", free: "Free", enterprise: "Enterprise" }[plan] || plan || "未知";
+      "business-premium": "Business Premium", self_serve_business_prolite: "Business Premium", business: "Business", team: "Team", pro: "Pro", free: "Free", enterprise: "Enterprise" }[plan] || plan || "未知";
   }
   function render(status) {
     modelConfig = status.config;
@@ -383,8 +383,14 @@ function managementSession() {
       cell(row, quota?.known ? format(quota.reset_at) : "—");
       cell(row, quota?.weekly ? remaining(quota.weekly.used_percent) : "未知");
       cell(row, format(quota?.weekly?.reset_at));
-      cell(row, a.disabled ? "凭据已禁用" : !isPlus(a) ? (a.plan_type ? "不参与唤醒 · 仅限 Plus" : "套餐未知 · 不参与唤醒") :
-        !selectedForWake(a) ? "未选择唤醒" : (states[slot?.status] || "尚未执行") + (slot?.status === "skipped" && reasons[slot.last_error] ? " · " + reasons[slot.last_error] : ""));
+      const authError = {
+        credential_reauth_required: "OAuth 凭据已失效，请在 CPA 重新登录此账号",
+        credential_refresh_failed: "OAuth 自动刷新失败，请检查网络或重新登录",
+        credential_refresh_unavailable: "CPA 不支持自动刷新，请升级 CPA 或重新登录",
+        quota_unauthorized: "刷新后仍认证失败，请在 CPA 重新登录此账号",
+      }[quota?.error];
+      cell(row, authError || (a.disabled ? "凭据已禁用" : !isPlus(a) ? (a.plan_type ? "不参与唤醒 · 仅限 Plus" : "套餐未知 · 不参与唤醒") :
+        !selectedForWake(a) ? "未选择唤醒" : (states[slot?.status] || "尚未执行") + (slot?.status === "skipped" && reasons[slot.last_error] ? " · " + reasons[slot.last_error] : "")));
       cell(
         row,
         slot ? Math.max(0, slot.attempts - 1) + " / " + slot.max_retries : "—",

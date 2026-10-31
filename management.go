@@ -168,7 +168,9 @@ func handleManagement(req managementRequest) ([]byte, error) {
 			now := time.Now()
 			q, err := h.FetchQuota(a, now)
 			if err != nil {
-				q = keeper.Quota{ObservedAt: now, Error: "quota_unavailable"}
+				if q.Error == "" {
+					q = keeper.Quota{ObservedAt: now, Error: "quota_unavailable"}
+				}
 			}
 			quotas[a.ID] = q
 		}
